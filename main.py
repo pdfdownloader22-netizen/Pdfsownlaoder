@@ -1,29 +1,50 @@
 # main.py
+# MongoDB-based Telegram PDF/Video Downloader Bot
+# Features:
+# - MongoDB persistent users/payments/settings
+# - Admin panel
+# - Welcome message/image
+# - PDF/Video download
+# - TXT batch links
+# - Download logs channel
+# - Payment approval/rejection
+# - Premium access
+# - Force join
+# - Add output channels
+# - Channel setup instructions
+# - Admin-controlled buttons/settings
+#
+# IMPORTANT:
+# This bot downloads only resources that are publicly accessible
+# and does not bypass DRM, authentication, CAPTCHA, or private
+# access controls.
 
 import os
 import re
-import json
 import time
 import uuid
 import shutil
-import sqlite3
 import asyncio
 import logging
 import mimetypes
 import tempfile
 from pathlib import Path
-from urllib.parse import (
-    urlparse,
-    parse_qs,
-    urlencode,
-    urlunparse,
-    unquote,
-)
+from urllib.parse import urlparse, unquote
 
 import aiohttp
 import aiofiles
-from flask import Flask, request, redirect, render_template_string, session
 from dotenv import load_dotenv
+
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+
+from flask import (
+    Flask,
+    request,
+    redirect,
+    render_template_string,
+    session,
+)
 
 from telegram import (
     Update,
@@ -41,446 +62,604 @@ from telegram.ext import (
     filters,
 )
 
-load_dotenv()
+# ============================================================
+# ENV
+# ============================================================
 
-# ============================================================
-# CONFIG
-# ============================================================
+load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
+MONGODB_URI = os.getenv(
+    "MONGODB_URI",
+    ""
+).strip()
+
+MONGODB_DB = os.getenv(
+    "MONGODB_DB",
+    "telegram_downloader"
+).strip()
+
 ADMIN_IDS = {
     int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "").split(",")
+    for x in os.getenv(
+        "ADMIN_IDS",
+        ""
+    ).split(",")
     if x.strip().isdigit()
 }
 
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "").strip().lstrip("@")
+LOG_CHANNEL_ID = os.getenv(
+    "LOG_CHANNEL_ID",
+    ""
+).strip()
 
-PORT = int(os.getenv("PORT", "8080"))
-SECRET_KEY = os.getenv(
-    "SECRET_KEY",
-    "CHANGE_THIS_SECRET_KEY"
+PORT = int(
+    os.getenv(
+        "PORT",
+        "8080"
+    )
 )
 
-MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "2000"))
-MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
+SECRET_KEY = os.getenv(
+    "SECRET_KEY",
+    "CHANGE_THIS_SECRET"
+)
 
-DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "1800"))
+MAX_FILE_SIZE_MB = int(
+    os.getenv(
+        "MAX_FILE_SIZE_MB",
+        "2000"
+    )
+)
+
+MAX_FILE_SIZE = (
+    MAX_FILE_SIZE_MB * 1024 * 1024
+)
+
+DOWNLOAD_TIMEOUT = int(
+    os.getenv(
+        "DOWNLOAD_TIMEOUT",
+        "1800"
+    )
+)
+
 MAX_CONCURRENT_DOWNLOADS = int(
-    os.getenv("MAX_CONCURRENT_DOWNLOADS", "3")
+    os.getenv(
+        "MAX_CONCURRENT_DOWNLOADS",
+        "3"
+    )
 )
 
 DEFAULT_PDF_PRICE = int(
-    os.getenv("PREMIUM_PDF_PRICE", "49")
+    os.getenv(
+        "PREMIUM_PDF_PRICE",
+        "49"
+    )
 )
 
 DEFAULT_VIDEO_PRICE = int(
-    os.getenv("PREMIUM_VIDEO_PRICE", "99")
+    os.getenv(
+        "PREMIUM_VIDEO_PRICE",
+        "99"
+    )
 )
 
 DEFAULT_PREMIUM_DAYS = int(
-    os.getenv("PREMIUM_DAYS", "30")
+    os.getenv(
+        "PREMIUM_DAYS",
+        "30"
+    )
 )
 
-DEFAULT_UPI = os.getenv("UPI_ID", "").strip()
+DEFAULT_UPI = os.getenv(
+    "UPI_ID",
+    ""
+).strip()
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(
+    __file__
+).resolve().parent
+
 DATA_DIR = BASE_DIR / "data"
-DOWNLOAD_DIR = DATA_DIR / "downloads"
-WELCOME_DIR = DATA_DIR / "welcome"
 
-DATA_DIR.mkdir(exist_ok=True)
-DOWNLOAD_DIR.mkdir(exist_ok=True)
-WELCOME_DIR.mkdir(exist_ok=True)
+DOWNLOAD_DIR = (
+    DATA_DIR / "downloads"
+)
 
-DB_FILE = DATA_DIR / "bot.db"
+WELCOME_DIR = (
+    DATA_DIR / "welcome"
+)
+
+DATA_DIR.mkdir(
+    exist_ok=True
+)
+
+DOWNLOAD_DIR.mkdir(
+    exist_ok=True
+)
+
+WELCOME_DIR.mkdir(
+    exist_ok=True
+)
+
+# ============================================================
+# LOGGING
+# ============================================================
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(message)s"
+    ),
     level=logging.INFO,
 )
 
-logger = logging.getLogger("download-bot")
-
-download_semaphore = asyncio.Semaphore(
-    MAX_CONCURRENT_DOWNLOADS
+logger = logging.getLogger(
+    "premium-downloader"
 )
 
 # ============================================================
-# DATABASE
+# MONGODB
 # ============================================================
 
-def db():
-    connection = sqlite3.connect(
-        DB_FILE,
-        timeout=30,
-        check_same_thread=False
-    )
-    connection.row_factory = sqlite3.Row
-    return connection
-
-
-def init_db():
-    con = db()
-    cur = con.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT DEFAULT '',
-            first_name TEXT DEFAULT '',
-            premium INTEGER DEFAULT 0,
-            premium_until INTEGER DEFAULT 0,
-            created_at INTEGER DEFAULT 0,
-            updated_at INTEGER DEFAULT 0
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT DEFAULT ''
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            plan TEXT,
-            amount INTEGER,
-            status TEXT DEFAULT 'pending',
-            created_at INTEGER,
-            approved_at INTEGER DEFAULT 0
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS downloads (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            url TEXT,
-            file_type TEXT,
-            filename TEXT,
-            size INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'processing',
-            created_at INTEGER
-        )
-    """)
-
-    defaults = {
-        "welcome_text": (
-            "🎓 <b>Welcome to Premium Downloader</b>\n\n"
-            "📥 PDF और Video download करने के लिए नीचे दिए "
-            "options का उपयोग करें।"
-        ),
-        "help_text": (
-            "🆘 <b>Help</b>\n\n"
-            "• PDF/Video का public URL भेजें\n"
-            "• Multiple links के लिए TXT file भेजें\n"
-            "• Premium download के लिए Buy Premium खोलें\n\n"
-            "अगर कोई समस्या हो तो admin से संपर्क करें।"
-        ),
-        "pdf_price": str(DEFAULT_PDF_PRICE),
-        "video_price": str(DEFAULT_VIDEO_PRICE),
-        "premium_days": str(DEFAULT_PREMIUM_DAYS),
-        "upi_id": DEFAULT_UPI,
-        "payment_text": (
-            "Payment करने के बाद transaction screenshot "
-            "और UTR भेजें।"
-        ),
-    }
-
-    for key, value in defaults.items():
-        cur.execute(
-            """
-            INSERT OR IGNORE INTO settings(key, value)
-            VALUES (?, ?)
-            """,
-            (key, value),
-        )
-
-    con.commit()
-    con.close()
-
-
-def get_setting(key, default=""):
-    con = db()
-    row = con.execute(
-        "SELECT value FROM settings WHERE key=?",
-        (key,),
-    ).fetchone()
-    con.close()
-
-    return row["value"] if row else default
-
-
-def set_setting(key, value):
-    con = db()
-
-    con.execute(
-        """
-        INSERT INTO settings(key,value)
-        VALUES (?,?)
-        ON CONFLICT(key)
-        DO UPDATE SET value=excluded.value
-        """,
-        (key, str(value)),
+if not MONGODB_URI:
+    raise RuntimeError(
+        "MONGODB_URI is missing in .env"
     )
 
-    con.commit()
-    con.close()
+mongo = MongoClient(
+    MONGODB_URI,
+    serverSelectionTimeoutMS=10000,
+)
+
+mongo.admin.command(
+    "ping"
+)
+
+db = mongo[
+    MONGODB_DB
+]
+
+users_col = db["users"]
+payments_col = db["payments"]
+downloads_col = db["downloads"]
+settings_col = db["settings"]
+channels_col = db["channels"]
+
+users_col.create_index(
+    "user_id",
+    unique=True
+)
+
+payments_col.create_index(
+    "payment_id",
+    unique=True
+)
+
+downloads_col.create_index(
+    "created_at"
+)
+
+channels_col.create_index(
+    "chat_id",
+    unique=True
+)
+
+# ============================================================
+# DEFAULT SETTINGS
+# ============================================================
+
+DEFAULT_SETTINGS = {
+    "welcome_text": (
+        "🎓 <b>Welcome</b>\n\n"
+        "📥 PDF और Video download करने के लिए "
+        "नीचे दिए options का उपयोग करें।"
+    ),
+
+    "help_text": (
+        "🆘 <b>Help</b>\n\n"
+        "1. PDF Download दबाएँ और PDF URL भेजें।\n"
+        "2. Video Download दबाएँ और Video URL भेजें।\n"
+        "3. Multiple links के लिए TXT file भेजें।\n"
+        "4. Premium feature के लिए Buy Premium खोलें।\n\n"
+        "Channel में file भेजने के लिए पहले "
+        "अपना channel bot में add करें।"
+    ),
+
+    "payment_text": (
+        "💳 Payment करने के बाद screenshot "
+        "और UTR/Transaction ID भेजें।\n\n"
+        "Admin verification के बाद access मिलेगा।"
+    ),
+
+    "upi_id": DEFAULT_UPI,
+
+    "pdf_price": DEFAULT_PDF_PRICE,
+
+    "video_price": DEFAULT_VIDEO_PRICE,
+
+    "premium_days": DEFAULT_PREMIUM_DAYS,
+
+    "force_join_enabled": False,
+
+    "force_join_channels": [],
+
+    "download_pdf_enabled": True,
+
+    "download_video_enabled": True,
+
+    "txt_enabled": True,
+
+    "channel_upload_enabled": True,
+
+    "maintenance": False,
+}
 
 
-def upsert_user(user):
-    now = int(time.time())
+def init_settings():
 
-    con = db()
+    for key, value in DEFAULT_SETTINGS.items():
 
-    con.execute(
-        """
-        INSERT INTO users(
-            user_id,
-            username,
-            first_name,
-            created_at,
-            updated_at
+        settings_col.update_one(
+            {
+                "key": key
+            },
+            {
+                "$setOnInsert": {
+                    "key": key,
+                    "value": value,
+                }
+            },
+            upsert=True,
         )
-        VALUES (?, ?, ?, ?, ?)
 
-        ON CONFLICT(user_id)
-        DO UPDATE SET
-            username=excluded.username,
-            first_name=excluded.first_name,
-            updated_at=excluded.updated_at
-        """,
-        (
-            user.id,
-            user.username or "",
-            user.first_name or "",
-            now,
-            now,
-        ),
+
+init_settings()
+
+
+def get_setting(
+    key,
+    default=None
+):
+
+    row = settings_col.find_one(
+        {
+            "key": key
+        }
     )
 
-    con.commit()
-    con.close()
+    if row is None:
+        return default
+
+    return row.get(
+        "value",
+        default
+    )
 
 
-def is_premium(user_id):
-    con = db()
+def set_setting(
+    key,
+    value
+):
 
-    row = con.execute(
-        """
-        SELECT premium, premium_until
-        FROM users
-        WHERE user_id=?
-        """,
-        (user_id,),
-    ).fetchone()
+    settings_col.update_one(
+        {
+            "key": key
+        },
+        {
+            "$set": {
+                "key": key,
+                "value": value,
+            }
+        },
+        upsert=True,
+    )
 
-    con.close()
 
-    if not row:
+# ============================================================
+# USER DATABASE
+# ============================================================
+
+def save_user(
+    user
+):
+
+    now = int(
+        time.time()
+    )
+
+    users_col.update_one(
+        {
+            "user_id": user.id
+        },
+        {
+            "$set": {
+                "username": (
+                    user.username or ""
+                ),
+                "first_name": (
+                    user.first_name or ""
+                ),
+                "last_name": (
+                    user.last_name or ""
+                ),
+                "updated_at": now,
+            },
+            "$setOnInsert": {
+                "user_id": user.id,
+                "premium": False,
+                "premium_until": 0,
+                "created_at": now,
+            },
+        },
+        upsert=True,
+    )
+
+
+def get_user(
+    user_id
+):
+
+    return users_col.find_one(
+        {
+            "user_id": user_id
+        }
+    )
+
+
+def premium_active(
+    user_id
+):
+
+    user = get_user(
+        user_id
+    )
+
+    if not user:
         return False
 
     return bool(
-        row["premium"]
-        and row["premium_until"] > int(time.time())
-    )
-
-
-def activate_premium(user_id, days):
-    until = int(time.time()) + days * 86400
-
-    con = db()
-
-    con.execute(
-        """
-        UPDATE users
-        SET premium=1,
-            premium_until=?,
-            updated_at=?
-        WHERE user_id=?
-        """,
-        (until, int(time.time()), user_id),
-    )
-
-    con.commit()
-    con.close()
-
-
-def create_payment(user_id, plan, amount):
-    con = db()
-
-    cur = con.execute(
-        """
-        INSERT INTO payments(
-            user_id,
-            plan,
-            amount,
-            status,
-            created_at
+        user.get(
+            "premium",
+            False
         )
-        VALUES (?, ?, ?, 'pending', ?)
-        """,
-        (
-            user_id,
-            plan,
-            amount,
-            int(time.time()),
-        ),
+        and
+        user.get(
+            "premium_until",
+            0
+        ) > int(
+            time.time()
+        )
     )
 
-    payment_id = cur.lastrowid
 
-    con.commit()
-    con.close()
+def activate_premium(
+    user_id,
+    days
+):
+
+    now = int(
+        time.time()
+    )
+
+    existing = get_user(
+        user_id
+    )
+
+    current_until = (
+        existing.get(
+            "premium_until",
+            0
+        )
+        if existing
+        else 0
+    )
+
+    start_from = max(
+        current_until,
+        now
+    )
+
+    until = (
+        start_from
+        + days * 86400
+    )
+
+    users_col.update_one(
+        {
+            "user_id": user_id
+        },
+        {
+            "$set": {
+                "premium": True,
+                "premium_until": until,
+                "updated_at": now,
+            }
+        },
+        upsert=True,
+    )
+
+    return until
+
+
+def deactivate_premium(
+    user_id
+):
+
+    users_col.update_one(
+        {
+            "user_id": user_id
+        },
+        {
+            "$set": {
+                "premium": False,
+                "premium_until": 0,
+                "updated_at": int(
+                    time.time()
+                ),
+            }
+        },
+    )
+
+
+# ============================================================
+# PAYMENT DATABASE
+# ============================================================
+
+def create_payment(
+    user_id,
+    plan,
+    amount
+):
+
+    payment_id = uuid.uuid4().hex[:12]
+
+    payments_col.insert_one(
+        {
+            "payment_id": payment_id,
+            "user_id": user_id,
+            "plan": plan,
+            "amount": amount,
+            "status": "pending",
+            "created_at": int(
+                time.time()
+            ),
+            "approved_at": 0,
+        }
+    )
 
     return payment_id
 
 
-def get_pending_payment(payment_id):
-    con = db()
+def get_payment(
+    payment_id
+):
 
-    row = con.execute(
-        """
-        SELECT *
-        FROM payments
-        WHERE id=?
-        """,
-        (payment_id,),
-    ).fetchone()
-
-    con.close()
-
-    return row
-
-
-def approve_payment(payment_id):
-    con = db()
-
-    row = con.execute(
-        """
-        SELECT *
-        FROM payments
-        WHERE id=?
-        """,
-        (payment_id,),
-    ).fetchone()
-
-    if not row:
-        con.close()
-        return None
-
-    con.execute(
-        """
-        UPDATE payments
-        SET status='approved',
-            approved_at=?
-        WHERE id=?
-        """,
-        (int(time.time()), payment_id),
+    return payments_col.find_one(
+        {
+            "payment_id": payment_id
+        }
     )
-
-    con.commit()
-    con.close()
-
-    return row
-
-
-def create_download(user_id, url, file_type, filename):
-    con = db()
-
-    cur = con.execute(
-        """
-        INSERT INTO downloads(
-            user_id,
-            url,
-            file_type,
-            filename,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            url,
-            file_type,
-            filename,
-            int(time.time()),
-        ),
-    )
-
-    download_id = cur.lastrowid
-
-    con.commit()
-    con.close()
-
-    return download_id
 
 
 # ============================================================
-# URL SECURITY / NORMALIZATION
+# DOWNLOAD LOG DATABASE
 # ============================================================
 
-def is_http_url(value):
+def save_download_log(
+    user,
+    url,
+    file_type,
+    filename,
+    size,
+    status
+):
+
+    downloads_col.insert_one(
+        {
+            "user_id": user.id,
+            "username": user.username or "",
+            "first_name": user.first_name or "",
+            "url": url,
+            "file_type": file_type,
+            "filename": filename,
+            "size": size,
+            "status": status,
+            "created_at": int(
+                time.time()
+            ),
+        }
+    )
+
+
+# ============================================================
+# URL
+# ============================================================
+
+def valid_url(
+    url
+):
+
     try:
-        parsed = urlparse(value.strip())
 
-        return parsed.scheme.lower() in {
-            "http",
-            "https",
-        } and bool(parsed.netloc)
+        parsed = urlparse(
+            url
+        )
+
+        return (
+            parsed.scheme.lower()
+            in {
+                "http",
+                "https",
+            }
+            and
+            bool(
+                parsed.netloc
+            )
+        )
 
     except Exception:
+
         return False
 
 
-def clean_url(value):
-    value = value.strip()
+def extract_urls(
+    text
+):
 
-    if value.startswith("<") and value.endswith(">"):
-        value = value[1:-1].strip()
-
-    value = value.strip('"').strip("'")
-
-    return value
-
-
-def extract_urls(text):
-    pattern = r'https?://[^\s<>"\'\]\)]+'
-
-    found = re.findall(
-        pattern,
-        text,
-        flags=re.IGNORECASE
+    pattern = (
+        r'https?://[^\s<>"\']+'
     )
 
-    result = []
+    urls = re.findall(
+        pattern,
+        text or "",
+        re.I
+    )
 
-    for item in found:
-        item = item.rstrip(".,;")
+    cleaned = []
 
-        if is_http_url(item):
-            result.append(item)
+    for url in urls:
 
-    return list(dict.fromkeys(result))
+        url = url.rstrip(
+            ".,;)]}>"
+        )
+
+        if valid_url(
+            url
+        ):
+            cleaned.append(
+                url
+            )
+
+    return list(
+        dict.fromkeys(
+            cleaned
+        )
+    )
 
 
 # ============================================================
 # GOOGLE DRIVE
 # ============================================================
 
-def google_drive_file_id(url):
+def google_drive_id(
+    url
+):
+
     patterns = [
-        r"/file/d/([a-zA-Z0-9_-]+)",
-        r"[?&]id=([a-zA-Z0-9_-]+)",
+        r"/file/d/([A-Za-z0-9_-]+)",
+        r"[?&]id=([A-Za-z0-9_-]+)",
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, url)
+
+        match = re.search(
+            pattern,
+            url
+        )
 
         if match:
             return match.group(1)
@@ -488,18 +667,28 @@ def google_drive_file_id(url):
     return None
 
 
-def normalize_google_drive(url):
-    parsed = urlparse(url)
+def normalize_url(
+    url
+):
+
+    parsed = urlparse(
+        url
+    )
 
     host = parsed.netloc.lower()
 
     if (
-        "drive.google.com" not in host
-        and "docs.google.com" not in host
+        "drive.google.com"
+        not in host
+        and
+        "docs.google.com"
+        not in host
     ):
         return url
 
-    file_id = google_drive_file_id(url)
+    file_id = google_drive_id(
+        url
+    )
 
     if not file_id:
         return url
@@ -511,35 +700,59 @@ def normalize_google_drive(url):
 
 
 # ============================================================
-# HEADERS
+# HTTP HEADERS
 # ============================================================
 
 COMMON_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 14) "
+        "Mozilla/5.0 "
+        "(Linux; Android 14) "
         "AppleWebKit/537.36 "
         "(KHTML, like Gecko) "
-        "Chrome/131.0 Mobile Safari/537.36"
+        "Chrome/131.0 "
+        "Mobile Safari/537.36"
     ),
+
     "Accept": (
-        "text/html,application/xhtml+xml,"
+        "text/html,"
+        "application/xhtml+xml,"
         "application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
+        "application/pdf,"
+        "video/*,"
+        "*/*;q=0.8"
     ),
-    "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
+
+    "Accept-Language":
+        "en-US,en;q=0.9,hi;q=0.8",
+
+    "Cache-Control":
+        "no-cache",
+
+    "Pragma":
+        "no-cache",
 }
 
 
-def build_headers(url):
-    headers = dict(COMMON_HEADERS)
+def build_headers(
+    url
+):
 
-    parsed = urlparse(url)
+    headers = dict(
+        COMMON_HEADERS
+    )
 
-    if parsed.scheme in {"http", "https"}:
+    parsed = urlparse(
+        url
+    )
+
+    if parsed.scheme in {
+        "http",
+        "https",
+    }:
+
         headers["Referer"] = (
-            f"{parsed.scheme}://{parsed.netloc}/"
+            f"{parsed.scheme}://"
+            f"{parsed.netloc}/"
         )
 
     return headers
@@ -549,8 +762,13 @@ def build_headers(url):
 # FILENAME
 # ============================================================
 
-def sanitize_filename(name):
-    name = unquote(name or "").strip()
+def sanitize_filename(
+    name
+):
+
+    name = unquote(
+        name or ""
+    ).strip()
 
     name = re.sub(
         r'[\\/:*?"<>|]+',
@@ -570,36 +788,54 @@ def sanitize_filename(name):
     return name[:180]
 
 
-def filename_from_headers(response, url):
-    content_disposition = response.headers.get(
+def filename_from_response(
+    response
+):
+
+    disposition = response.headers.get(
         "Content-Disposition",
         ""
     )
 
     match = re.search(
-        r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?',
-        content_disposition,
-        re.IGNORECASE,
+        r'filename\*?='
+        r'(?:UTF-8\'\')?'
+        r'"?([^";]+)"?',
+        disposition,
+        re.I
     )
 
     if match:
+
         return sanitize_filename(
-            unquote(match.group(1))
+            match.group(1)
         )
 
-    path = urlparse(url).path
+    name = Path(
+        urlparse(
+            str(
+                response.url
+            )
+        ).path
+    ).name
 
-    name = Path(path).name
-
-    return sanitize_filename(name)
+    return sanitize_filename(
+        name
+    )
 
 
 # ============================================================
-# DOWNLOAD ENGINE
+# DOWNLOAD
 # ============================================================
 
-async def download_url(url, output_dir):
-    url = normalize_google_drive(url)
+async def download_file(
+    url,
+    output_dir
+):
+
+    url = normalize_url(
+        url
+    )
 
     timeout = aiohttp.ClientTimeout(
         total=DOWNLOAD_TIMEOUT,
@@ -613,12 +849,10 @@ async def download_url(url, output_dir):
         ttl_dns_cache=300,
     )
 
-    headers = build_headers(url)
-
     async with aiohttp.ClientSession(
         timeout=timeout,
         connector=connector,
-        headers=headers,
+        headers=build_headers(url),
         raise_for_status=False,
     ) as session:
 
@@ -628,95 +862,135 @@ async def download_url(url, output_dir):
         ) as response:
 
             if response.status >= 400:
+
                 raise RuntimeError(
                     f"HTTP {response.status}"
                 )
 
-            content_length = response.headers.get(
-                "Content-Length"
+            content_length = (
+                response.headers.get(
+                    "Content-Length"
+                )
             )
 
             if content_length:
-                try:
-                    size = int(content_length)
 
-                    if size > MAX_FILE_SIZE:
+                try:
+
+                    if (
+                        int(
+                            content_length
+                        )
+                        > MAX_FILE_SIZE
+                    ):
+
                         raise RuntimeError(
-                            f"File exceeds {MAX_FILE_SIZE_MB} MB"
+                            "File size exceeds "
+                            f"{MAX_FILE_SIZE_MB} MB"
                         )
 
                 except ValueError:
                     pass
 
-            filename = filename_from_headers(
-                response,
-                str(response.url),
-            )
-
             content_type = (
                 response.headers.get(
                     "Content-Type",
                     ""
+                ).lower()
+            )
+
+            filename = (
+                filename_from_response(
+                    response
                 )
-                .lower()
             )
 
             if filename == "download":
+
                 if "pdf" in content_type:
-                    filename = "document.pdf"
 
-                elif "video" in content_type:
-                    filename = "video.mp4"
-
-                else:
-                    ext = mimetypes.guess_extension(
-                        content_type.split(";")[0]
+                    filename = (
+                        "document.pdf"
                     )
 
-                    filename += ext or ""
+                elif "video/" in content_type:
+
+                    filename = (
+                        "video.mp4"
+                    )
+
+                else:
+
+                    extension = (
+                        mimetypes.guess_extension(
+                            content_type.split(
+                                ";"
+                            )[0]
+                        )
+                        or ""
+                    )
+
+                    filename += extension
 
             if "." not in filename:
+
                 if "pdf" in content_type:
+
                     filename += ".pdf"
 
-                elif "video" in content_type:
+                elif "video/" in content_type:
+
                     filename += ".mp4"
 
-            filename = sanitize_filename(filename)
+            filename = sanitize_filename(
+                filename
+            )
 
-            output_path = (
-                Path(output_dir) / f"{uuid.uuid4().hex}_{filename}"
+            path = (
+                Path(output_dir)
+                /
+                f"{uuid.uuid4().hex}_"
+                f"{filename}"
             )
 
             total = 0
 
             async with aiofiles.open(
-                output_path,
+                path,
                 "wb"
             ) as file:
 
                 async for chunk in response.content.iter_chunked(
                     1024 * 1024
                 ):
-                    total += len(chunk)
 
-                    if total > MAX_FILE_SIZE:
-                        await file.close()
+                    total += len(
+                        chunk
+                    )
+
+                    if (
+                        total
+                        > MAX_FILE_SIZE
+                    ):
 
                         try:
-                            output_path.unlink()
+                            path.unlink()
                         except Exception:
                             pass
 
                         raise RuntimeError(
-                            f"File exceeds {MAX_FILE_SIZE_MB} MB"
+                            "File size exceeds "
+                            f"{MAX_FILE_SIZE_MB} MB"
                         )
 
-                    await file.write(chunk)
+                    await file.write(
+                        chunk
+                    )
 
             if total <= 0:
+
                 try:
-                    output_path.unlink()
+                    path.unlink()
                 except Exception:
                     pass
 
@@ -725,28 +999,37 @@ async def download_url(url, output_dir):
                 )
 
             return {
-                "path": str(output_path),
+                "path": str(path),
                 "filename": filename,
                 "size": total,
                 "content_type": content_type,
-                "final_url": str(response.url),
+                "final_url": str(
+                    response.url
+                ),
             }
 
 
 # ============================================================
-# DOWNLOAD TYPE
+# TYPE
 # ============================================================
 
-def detect_type(filename="", content_type=""):
+def detect_type(
+    filename,
+    content_type
+):
+
     value = (
-        f"{filename} {content_type}"
-        .lower()
-    )
+        f"{filename} "
+        f"{content_type}"
+    ).lower()
 
     if (
         ".pdf" in value
-        or "application/pdf" in value
+        or
+        "application/pdf"
+        in value
     ):
+
         return "pdf"
 
     video_extensions = (
@@ -757,81 +1040,195 @@ def detect_type(filename="", content_type=""):
         ".avi",
         ".m4v",
         ".ts",
-        ".m3u8",
-        ".mpd",
     )
 
-    if any(ext in value for ext in video_extensions):
+    if any(
+        x in value
+        for x in video_extensions
+    ):
+
         return "video"
 
-    if "video/" in content_type:
+    if (
+        "video/"
+        in content_type
+    ):
+
         return "video"
 
     return "unknown"
 
 
 # ============================================================
-# TELEGRAM UI
+# FORCE JOIN
+# ============================================================
+
+async def force_join_ok(
+    user_id,
+    context
+):
+
+    if not get_setting(
+        "force_join_enabled",
+        False
+    ):
+
+        return True
+
+    channels = get_setting(
+        "force_join_channels",
+        []
+    )
+
+    if not channels:
+        return True
+
+    for channel in channels:
+
+        try:
+
+            member = (
+                await context.bot.get_chat_member(
+                    chat_id=channel["chat_id"],
+                    user_id=user_id,
+                )
+            )
+
+            if member.status in {
+                "left",
+                "kicked",
+            }:
+
+                return False
+
+        except Exception as exc:
+
+            logger.warning(
+                "Force join check failed: %s",
+                exc
+            )
+
+            return False
+
+    return True
+
+
+async def require_force_join(
+    update,
+    context
+):
+
+    if await force_join_ok(
+        update.effective_user.id,
+        context
+    ):
+
+        return True
+
+    channels = get_setting(
+        "force_join_channels",
+        []
+    )
+
+    buttons = []
+
+    for channel in channels:
+
+        invite = channel.get(
+            "invite",
+            ""
+        )
+
+        if invite:
+
+            buttons.append([
+                InlineKeyboardButton(
+                    "📢 Join Channel",
+                    url=invite
+                )
+            ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "🔄 Check Join",
+            callback_data="check_join"
+        )
+    ])
+
+    await update.effective_message.reply_text(
+        "🔒 <b>Access Required</b>\n\n"
+        "Bot use करने से पहले required "
+        "channel join करें।",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            buttons
+        )
+    )
+
+    return False
+
+
+# ============================================================
+# MAIN KEYBOARD
 # ============================================================
 
 def main_keyboard():
-    return InlineKeyboardMarkup([
-        [
+
+    rows = []
+
+    if get_setting(
+        "download_pdf_enabled",
+        True
+    ):
+
+        rows.append([
             InlineKeyboardButton(
                 "📄 PDF Download",
-                callback_data="download_pdf",
-            ),
+                callback_data="download_pdf"
+            )
+        ])
+
+    if get_setting(
+        "download_video_enabled",
+        True
+    ):
+
+        rows.append([
             InlineKeyboardButton(
                 "🎥 Video Download",
-                callback_data="download_video",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "💎 Buy Premium",
-                callback_data="premium",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "🆘 Help",
-                callback_data="help",
-            ),
-        ],
+                callback_data="download_video"
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            "💎 Buy Premium",
+            callback_data="premium"
+        )
     ])
 
+    if get_setting(
+        "channel_upload_enabled",
+        True
+    ):
 
-def premium_keyboard():
-    pdf_price = get_setting(
-        "pdf_price",
-        str(DEFAULT_PDF_PRICE)
-    )
+        rows.append([
+            InlineKeyboardButton(
+                "📢 Add Channel",
+                callback_data="add_channel"
+            )
+        ])
 
-    video_price = get_setting(
-        "video_price",
-        str(DEFAULT_VIDEO_PRICE)
-    )
-
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                f"📄 Premium PDF ₹{pdf_price}",
-                callback_data="buy_pdf",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                f"🎥 Premium Video ₹{video_price}",
-                callback_data="buy_video",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⬅️ Back",
-                callback_data="home",
-            )
-        ],
+    rows.append([
+        InlineKeyboardButton(
+            "🆘 Help",
+            callback_data="help"
+        )
     ])
+
+    return InlineKeyboardMarkup(
+        rows
+    )
 
 
 # ============================================================
@@ -839,79 +1236,73 @@ def premium_keyboard():
 # ============================================================
 
 async def send_welcome(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    update,
+    context
 ):
+
     user = update.effective_user
 
     if user:
-        upsert_user(user)
+        save_user(
+            user
+        )
+
+    if not await require_force_join(
+        update,
+        context
+    ):
+
+        return
+
+    if get_setting(
+        "maintenance",
+        False
+    ) and user.id not in ADMIN_IDS:
+
+        await update.effective_message.reply_text(
+            "🛠 Bot अभी maintenance mode में है।"
+        )
+
+        return
 
     text = get_setting(
         "welcome_text",
         "Welcome"
     )
 
-    image_files = list(
+    images = list(
         WELCOME_DIR.glob("*")
     )
 
-    if update.callback_query:
-        query = update.callback_query
+    if images:
 
         try:
-            await query.message.delete()
-        except Exception:
-            pass
 
-        if image_files:
-            try:
-                with open(
-                    image_files[0],
-                    "rb"
-                ) as photo:
-                    await query.message.chat.send_photo(
-                        photo=photo,
-                        caption=text,
-                        parse_mode="HTML",
-                        reply_markup=main_keyboard(),
-                    )
-                    return
-            except Exception:
-                pass
-
-        await query.message.chat.send_message(
-            text=text,
-            parse_mode="HTML",
-            reply_markup=main_keyboard(),
-        )
-
-        return
-
-    chat_id = update.effective_chat.id
-
-    if image_files:
-        try:
             with open(
-                image_files[0],
+                images[0],
                 "rb"
             ) as photo:
-                await context.bot.send_photo(
-                    chat_id=chat_id,
+
+                await update.effective_message.reply_photo(
                     photo=photo,
                     caption=text,
                     parse_mode="HTML",
-                    reply_markup=main_keyboard(),
+                    reply_markup=main_keyboard()
                 )
-                return
-        except Exception:
-            pass
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
+                return
+
+        except Exception as exc:
+
+            logger.warning(
+                "Welcome image error: %s",
+                exc
+            )
+
+    await update.effective_message.reply_text(
+        text,
         parse_mode="HTML",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard()
     )
 
 
@@ -919,10 +1310,11 @@ async def send_welcome(
 # START
 # ============================================================
 
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+async def start(
+    update,
+    context
 ):
+
     await send_welcome(
         update,
         context
@@ -930,96 +1322,157 @@ async def start_command(
 
 
 # ============================================================
-# CALLBACKS
+# CALLBACK
 # ============================================================
 
 async def callbacks(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    update,
+    context
 ):
+
     query = update.callback_query
 
     await query.answer()
 
     user = query.from_user
 
-    upsert_user(user)
+    save_user(
+        user
+    )
 
     data = query.data
 
     if data == "home":
+
+        await query.message.delete()
+
         await send_welcome(
             update,
             context
         )
+
         return
 
-    if data == "premium":
-        await query.message.edit_text(
-            "💎 <b>Premium Plans</b>\n\n"
-            "Premium खरीदने के लिए नीचे plan select करें।",
-            parse_mode="HTML",
-            reply_markup=premium_keyboard(),
-        )
+    if data == "check_join":
+
+        if await force_join_ok(
+            user.id,
+            context
+        ):
+
+            await query.message.edit_text(
+                "✅ Channel membership verified."
+            )
+
+            await context.bot.send_message(
+                user.id,
+                get_setting(
+                    "welcome_text",
+                    "Welcome"
+                ),
+                parse_mode="HTML",
+                reply_markup=main_keyboard()
+            )
+
+        else:
+
+            await query.answer(
+                "पहले required channel join करें।",
+                show_alert=True
+            )
+
         return
 
-    if data == "help":
-        await query.message.edit_text(
-            get_setting(
-                "help_text",
-                "Help unavailable"
-            ),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Back",
-                        callback_data="home",
-                    )
-                ]
-            ]),
-        )
-        return
-
-    if data in {
-        "download_pdf",
-        "download_video",
-    }:
-
-        requested_type = (
-            "pdf"
-            if data == "download_pdf"
-            else "video"
-        )
+    if data == "download_pdf":
 
         context.user_data[
             "requested_type"
-        ] = requested_type
-
-        label = (
-            "PDF"
-            if requested_type == "pdf"
-            else "Video"
-        )
+        ] = "pdf"
 
         await query.message.edit_text(
-            f"📥 <b>{label} Download</b>\n\n"
-            f"अब {label} का direct/public URL भेजें।\n\n"
-            "Multiple links के लिए TXT file भी भेज सकते हैं।",
+            "📄 <b>PDF Download</b>\n\n"
+            "अब PDF का URL भेजें।\n\n"
+            "Multiple URLs के लिए TXT file भी भेज सकते हैं।",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
                         "⬅️ Back",
-                        callback_data="home",
+                        callback_data="home"
                     )
                 ]
-            ]),
+            ])
         )
 
         return
 
-    if data in {"buy_pdf", "buy_video"}:
+    if data == "download_video":
+
+        context.user_data[
+            "requested_type"
+        ] = "video"
+
+        await query.message.edit_text(
+            "🎥 <b>Video Download</b>\n\n"
+            "अब video का direct/public URL भेजें।\n\n"
+            "Multiple URLs के लिए TXT file भी भेज सकते हैं।",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back",
+                        callback_data="home"
+                    )
+                ]
+            ])
+        )
+
+        return
+
+    if data == "premium":
+
+        pdf_price = get_setting(
+            "pdf_price",
+            DEFAULT_PDF_PRICE
+        )
+
+        video_price = get_setting(
+            "video_price",
+            DEFAULT_VIDEO_PRICE
+        )
+
+        await query.message.edit_text(
+            "💎 <b>Premium Plans</b>\n\n"
+            "Premium download के लिए plan select करें।",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        f"📄 PDF ₹{pdf_price}",
+                        callback_data="buy_pdf"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        f"🎥 Video ₹{video_price}",
+                        callback_data="buy_video"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back",
+                        callback_data="home"
+                    )
+                ]
+            ])
+        )
+
+        return
+
+    if data in {
+        "buy_pdf",
+        "buy_video"
+    }:
 
         plan = (
             "pdf"
@@ -1032,7 +1485,7 @@ async def callbacks(
                 "pdf_price"
                 if plan == "pdf"
                 else "video_price",
-                "49"
+                DEFAULT_PDF_PRICE
             )
         )
 
@@ -1054,610 +1507,1094 @@ async def callbacks(
 
         await query.message.edit_text(
             (
-                f"💎 <b>Premium {plan.upper()}</b>\n\n"
+                f"💎 <b>Premium "
+                f"{plan.upper()}</b>\n\n"
                 f"💰 Price: ₹{amount}\n"
-                f"🆔 Payment ID: <code>{payment_id}</code>\n\n"
-                f"💳 UPI: <code>{upi}</code>\n\n"
-                f"{payment_text}\n\n"
-                "Payment के बाद इसी chat में "
-                "screenshot + UTR भेजें।"
+                f"🆔 Payment ID: "
+                f"<code>{payment_id}</code>\n\n"
+                f"💳 UPI: "
+                f"<code>{upi}</code>\n\n"
+                f"{payment_text}"
             ),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
-                        "📤 Send Payment Proof",
+                        "📤 Payment Proof",
                         callback_data=(
                             f"proof_{payment_id}"
-                        ),
+                        )
                     )
                 ],
                 [
                     InlineKeyboardButton(
                         "⬅️ Back",
-                        callback_data="premium",
+                        callback_data="premium"
                     )
-                ],
-            ]),
+                ]
+            ])
         )
 
         return
 
-    if data.startswith("proof_"):
-        payment_id = data.split("_", 1)[1]
+    if data.startswith(
+        "proof_"
+    ):
+
+        payment_id = data.split(
+            "_",
+            1
+        )[1]
+
+        payment = get_payment(
+            payment_id
+        )
+
+        if (
+            not payment
+            or
+            payment["user_id"]
+            != user.id
+        ):
+
+            await query.answer(
+                "Invalid payment.",
+                show_alert=True
+            )
+
+            return
 
         context.user_data[
             "proof_payment_id"
         ] = payment_id
 
         await query.message.reply_text(
-            "📤 अब payment screenshot भेजें।\n\n"
-            "साथ में UTR/Transaction ID भी text में भेज सकते हैं।"
+            "📤 अब payment screenshot भेजें।\n"
+            "फिर UTR/Transaction ID text में भेजें।"
+        )
+
+        return
+
+    if data == "add_channel":
+
+        await query.message.edit_text(
+            "📢 <b>Channel में PDF/Video भेजना</b>\n\n"
+            "Step 1️⃣: अपना Telegram channel बनाएं/खोलें।\n\n"
+            "Step 2️⃣: Bot को channel में Administrator बनाएं।\n\n"
+            "Step 3️⃣: Bot को कम-से-कम ये permissions दें:\n"
+            "• Post Messages\n"
+            "• Edit Messages\n"
+            "• Delete Messages (optional)\n\n"
+            "Step 4️⃣: Channel में कोई message भेजें।\n\n"
+            "Step 5️⃣: Bot में वापस आकर channel ID/username भेजें।\n\n"
+            "⚠️ Bot तभी channel में file भेज पाएगा "
+            "जब उसे channel में पर्याप्त permission मिले।",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back",
+                        callback_data="home"
+                    )
+                ]
+            ])
+        )
+
+        context.user_data[
+            "waiting_channel"
+        ] = True
+
+        return
+
+    if data == "help":
+
+        await query.message.edit_text(
+            get_setting(
+                "help_text",
+                "Help unavailable"
+            ),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back",
+                        callback_data="home"
+                    )
+                ]
+            ])
         )
 
         return
 
 
 # ============================================================
-# PAYMENT PROOF
+# PAYMENT PHOTO
 # ============================================================
 
-async def handle_photo(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+async def payment_photo(
+    update,
+    context
 ):
-    user = update.effective_user
 
-    upsert_user(user)
+    user = update.effective_user
 
     payment_id = context.user_data.get(
         "proof_payment_id"
     )
 
     if not payment_id:
-        await update.message.reply_text(
-            "पहले Buy Premium से payment plan select करें।"
-        )
         return
 
-    payment = get_pending_payment(
+    payment = get_payment(
+        payment_id
+    )
+
+    if (
+        not payment
+        or
+        payment["user_id"]
+        != user.id
+    ):
+
+        await update.message.reply_text(
+            "❌ Invalid payment."
+        )
+
+        return
+
+    context.user_data[
+        "payment_proof_file_id"
+    ] = update.message.photo[-1].file_id
+
+    await update.message.reply_text(
+        "✅ Screenshot receive हो गया।\n\n"
+        "अब UTR/Transaction ID भेजें।"
+    )
+
+
+# ============================================================
+# PAYMENT UTR
+# ============================================================
+
+async def payment_utr(
+    update,
+    context
+):
+
+    payment_id = context.user_data.get(
+        "proof_payment_id"
+    )
+
+    if not payment_id:
+        return False
+
+    payment = get_payment(
         payment_id
     )
 
     if not payment:
-        await update.message.reply_text(
-            "❌ Payment request नहीं मिली।"
+        context.user_data.pop(
+            "proof_payment_id",
+            None
         )
-        return
 
-    if payment["user_id"] != user.id:
-        await update.message.reply_text(
-            "❌ Invalid payment request."
-        )
-        return
+        return False
 
-    await update.message.reply_text(
-        "✅ Payment proof receive हो गया है।\n"
-        "Admin verification के बाद premium activate होगा।"
+    user = update.effective_user
+
+    utr = (
+        update.message.text
+        or ""
+    ).strip()
+
+    proof_file_id = context.user_data.get(
+        "payment_proof_file_id"
     )
 
-    caption = (
-        "💳 <b>New Payment Proof</b>\n\n"
-        f"Payment ID: <code>{payment_id}</code>\n"
-        f"User ID: <code>{user.id}</code>\n"
-        f"Username: @{user.username or 'N/A'}\n"
-        f"Plan: {payment['plan']}\n"
-        f"Amount: ₹{payment['amount']}"
+    payments_col.update_one(
+        {
+            "payment_id": payment_id
+        },
+        {
+            "$set": {
+                "utr": utr[:200],
+                "proof_file_id": proof_file_id or "",
+                "submitted_at": int(
+                    time.time()
+                ),
+            }
+        }
+    )
+
+    admin_text = (
+        "💳 <b>New Payment Request</b>\n\n"
+        f"Payment ID: "
+        f"<code>{payment_id}</code>\n"
+        f"User ID: "
+        f"<code>{user.id}</code>\n"
+        f"Username: "
+        f"@{user.username or 'N/A'}\n"
+        f"Plan: "
+        f"{payment['plan'].upper()}\n"
+        f"Amount: ₹{payment['amount']}\n"
+        f"UTR: "
+        f"<code>{utr[:200]}</code>"
     )
 
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "✅ Approve",
-                callback_data=f"approve_{payment_id}",
+                "✅ APPROVE",
+                callback_data=(
+                    f"approve_{payment_id}"
+                )
             ),
             InlineKeyboardButton(
-                "❌ Reject",
-                callback_data=f"reject_{payment_id}",
-            ),
+                "❌ REJECT",
+                callback_data=(
+                    f"reject_{payment_id}"
+                )
+            )
         ]
     ])
 
     for admin_id in ADMIN_IDS:
+
         try:
-            await context.bot.send_photo(
-                chat_id=admin_id,
-                photo=update.message.photo[-1].file_id,
-                caption=caption,
-                parse_mode="HTML",
-                reply_markup=keyboard,
-            )
+
+            if proof_file_id:
+
+                await context.bot.send_photo(
+                    admin_id,
+                    proof_file_id,
+                    caption=admin_text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
+
+            else:
+
+                await context.bot.send_message(
+                    admin_id,
+                    admin_text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
+
         except Exception as exc:
+
             logger.error(
-                "Admin proof send error: %s",
+                "Payment admin notify error: %s",
                 exc
             )
+
+    await update.message.reply_text(
+        "✅ Payment proof submit हो गया है।\n\n"
+        "Admin verification के बाद premium activate होगा।"
+    )
 
     context.user_data.pop(
         "proof_payment_id",
         None
     )
 
+    context.user_data.pop(
+        "payment_proof_file_id",
+        None
+    )
+
+    return True
+
 
 # ============================================================
-# ADMIN PAYMENT CALLBACK
+# ADMIN PAYMENT ACTION
 # ============================================================
 
-async def admin_payment_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+async def admin_payment_action(
+    update,
+    context
 ):
+
     query = update.callback_query
 
     if query.from_user.id not in ADMIN_IDS:
+
         await query.answer(
             "Unauthorized",
             show_alert=True
         )
+
         return
 
     await query.answer()
 
     data = query.data
 
-    if data.startswith("approve_"):
-        payment_id = int(
-            data.split("_", 1)[1]
-        )
+    if data.startswith(
+        "approve_"
+    ):
 
-        payment = approve_payment(
+        payment_id = data.split(
+            "_",
+            1
+        )[1]
+
+        payment = get_payment(
             payment_id
         )
 
         if not payment:
-            await query.edit_message_caption(
-                "❌ Payment not found."
+
+            await query.answer(
+                "Payment not found.",
+                show_alert=True
             )
+
+            return
+
+        if payment["status"] == "approved":
+
+            await query.answer(
+                "Already approved.",
+                show_alert=True
+            )
+
             return
 
         days = int(
             get_setting(
                 "premium_days",
-                str(DEFAULT_PREMIUM_DAYS)
+                DEFAULT_PREMIUM_DAYS
             )
         )
 
-        activate_premium(
+        payments_col.update_one(
+            {
+                "payment_id": payment_id
+            },
+            {
+                "$set": {
+                    "status": "approved",
+                    "approved_at": int(
+                        time.time()
+                    ),
+                    "approved_by":
+                        query.from_user.id,
+                }
+            }
+        )
+
+        until = activate_premium(
             payment["user_id"],
             days
         )
 
-        await query.edit_message_caption(
-            (
-                "✅ <b>Payment Approved</b>\n\n"
-                f"Payment ID: <code>{payment_id}</code>\n"
-                f"User ID: <code>{payment['user_id']}</code>\n"
-                f"Plan: {payment['plan']}\n"
-                f"Premium: {days} days"
-            ),
-            parse_mode="HTML"
+        await query.edit_message_reply_markup(
+            reply_markup=None
+        )
+
+        await query.message.reply_text(
+            "✅ Payment Approved\n"
+            f"Payment: {payment_id}\n"
+            f"User: {payment['user_id']}\n"
+            f"Premium: {days} days"
         )
 
         try:
+
             await context.bot.send_message(
-                chat_id=payment["user_id"],
-                text=(
+                payment["user_id"],
+                (
                     "🎉 <b>Premium Activated!</b>\n\n"
-                    f"Plan: {payment['plan'].upper()}\n"
-                    f"Validity: {days} days\n\n"
-                    "अब आप premium download कर सकते हैं।"
+                    f"Plan: "
+                    f"{payment['plan'].upper()}\n"
+                    f"Validity: "
+                    f"{days} days\n\n"
+                    "अब premium download available है।"
                 ),
                 parse_mode="HTML",
-                reply_markup=main_keyboard(),
+                reply_markup=main_keyboard()
             )
+
         except Exception:
             pass
 
         return
 
-    if data.startswith("reject_"):
-        payment_id = int(
-            data.split("_", 1)[1]
-        )
+    if data.startswith(
+        "reject_"
+    ):
 
-        payment = get_pending_payment(
+        payment_id = data.split(
+            "_",
+            1
+        )[1]
+
+        payment = get_payment(
             payment_id
         )
 
         if not payment:
-            await query.edit_message_caption(
-                "❌ Payment not found."
-            )
             return
 
-        con = db()
-
-        con.execute(
-            """
-            UPDATE payments
-            SET status='rejected'
-            WHERE id=?
-            """,
-            (payment_id,),
+        payments_col.update_one(
+            {
+                "payment_id": payment_id
+            },
+            {
+                "$set": {
+                    "status": "rejected",
+                    "rejected_at": int(
+                        time.time()
+                    ),
+                    "rejected_by":
+                        query.from_user.id,
+                }
+            }
         )
 
-        con.commit()
-        con.close()
+        await query.edit_message_reply_markup(
+            reply_markup=None
+        )
 
-        await query.edit_message_caption(
-            (
-                "❌ <b>Payment Rejected</b>\n\n"
-                f"Payment ID: <code>{payment_id}</code>"
-            ),
-            parse_mode="HTML"
+        await query.message.reply_text(
+            f"❌ Payment Rejected\n"
+            f"Payment: {payment_id}"
         )
 
         try:
+
             await context.bot.send_message(
-                chat_id=payment["user_id"],
-                text=(
-                    "❌ आपका payment proof reject किया गया है।\n"
-                    "कृपया सही payment proof भेजें।"
-                ),
+                payment["user_id"],
+                "❌ आपका payment proof reject किया गया है।"
             )
+
         except Exception:
             pass
 
 
 # ============================================================
-# URL DOWNLOAD
+# DOWNLOAD PROCESS
 # ============================================================
 
-async def process_single_url(
+download_lock = asyncio.Semaphore(
+    MAX_CONCURRENT_DOWNLOADS
+)
+
+
+async def process_url(
     update,
     context,
     url,
-    requested_type=None,
+    requested_type
 ):
+
     user = update.effective_user
 
-    if not is_http_url(url):
-        return False, "Invalid URL"
+    if not valid_url(
+        url
+    ):
 
-    if requested_type in {
-        "pdf",
-        "video",
-    } and not is_premium(user.id):
         return (
             False,
-            "premium_required"
+            "Invalid URL"
         )
 
-    async with download_semaphore:
+    if not premium_active(
+        user.id
+    ):
 
-        work_dir = tempfile.mkdtemp(
-            dir=DOWNLOAD_DIR
+        return (
+            False,
+            "premium"
         )
 
-        download_id = None
+    work_dir = tempfile.mkdtemp(
+        dir=DOWNLOAD_DIR
+    )
 
-        try:
-            await context.bot.send_chat_action(
-                chat_id=update.effective_chat.id,
-                action=ChatAction.UPLOAD_DOCUMENT,
-            )
+    try:
 
-            result = await download_url(
+        async with download_lock:
+
+            result = await download_file(
                 url,
                 work_dir
             )
 
-            detected = detect_type(
-                result["filename"],
-                result["content_type"]
+        detected = detect_type(
+            result["filename"],
+            result["content_type"]
+        )
+
+        if (
+            requested_type
+            and
+            detected != requested_type
+        ):
+
+            raise RuntimeError(
+                "URL से requested file type नहीं मिला।"
             )
 
-            if requested_type == "pdf":
-                if detected != "pdf":
-                    raise RuntimeError(
-                        "यह URL PDF file नहीं है।"
-                    )
+        save_download_log(
+            user,
+            url,
+            detected,
+            result["filename"],
+            result["size"],
+            "success"
+        )
 
-            if requested_type == "video":
-                if detected != "video":
-                    raise RuntimeError(
-                        "यह URL video file नहीं है।"
-                    )
+        await send_log_channel(
+            update,
+            context,
+            url,
+            result,
+            detected
+        )
 
-            file_type = (
-                detected
-                if detected != "unknown"
-                else "file"
-            )
+        caption = (
+            f"📥 <b>{result['filename']}</b>\n\n"
+            f"📦 "
+            f"{result['size'] / 1024 / 1024:.2f} MB"
+        )
 
-            download_id = create_download(
-                user.id,
-                url,
-                file_type,
-                result["filename"]
-            )
+        with open(
+            result["path"],
+            "rb"
+        ) as file:
 
-            size_mb = (
-                result["size"]
-                / 1024
-                / 1024
-            )
+            if detected == "video":
 
-            caption = (
-                f"📥 <b>{result['filename']}</b>\n\n"
-                f"📦 Size: {size_mb:.2f} MB"
-            )
+                await update.effective_chat.send_video(
+                    video=InputFile(
+                        file,
+                        filename=result["filename"]
+                    ),
+                    caption=caption,
+                    parse_mode="HTML",
+                    supports_streaming=True
+                )
 
-            path = result["path"]
+            else:
 
-            with open(path, "rb") as file:
+                await update.effective_chat.send_document(
+                    document=InputFile(
+                        file,
+                        filename=result["filename"]
+                    ),
+                    caption=caption,
+                    parse_mode="HTML"
+                )
 
-                if file_type == "video":
-                    await update.effective_chat.send_video(
-                        video=InputFile(
-                            file,
-                            filename=result["filename"]
-                        ),
-                        caption=caption,
-                        parse_mode="HTML",
-                        supports_streaming=True,
-                    )
-                else:
-                    await update.effective_chat.send_document(
-                        document=InputFile(
-                            file,
-                            filename=result["filename"]
-                        ),
-                        caption=caption,
-                        parse_mode="HTML",
-                    )
+        return (
+            True,
+            "success"
+        )
 
-            return True, "success"
+    except Exception as exc:
 
-        except Exception as exc:
-            logger.exception(
-                "Download error"
-            )
+        save_download_log(
+            user,
+            url,
+            requested_type or "unknown",
+            "",
+            0,
+            f"error: {exc}"
+        )
 
-            return (
-                False,
-                str(exc)
-            )
+        await send_error_log(
+            update,
+            context,
+            url,
+            str(exc)
+        )
 
-        finally:
-            shutil.rmtree(
-                work_dir,
-                ignore_errors=True
-            )
+        return (
+            False,
+            str(exc)
+        )
+
+    finally:
+
+        shutil.rmtree(
+            work_dir,
+            ignore_errors=True
+        )
 
 
 # ============================================================
-# TEXT URL HANDLER
+# LOG CHANNEL
+# ============================================================
+
+def log_channel_id():
+
+    try:
+        return int(
+            LOG_CHANNEL_ID
+        )
+    except Exception:
+        return None
+
+
+async def send_log_channel(
+    update,
+    context,
+    url,
+    result,
+    detected
+):
+
+    channel_id = log_channel_id()
+
+    if not channel_id:
+        return
+
+    user = update.effective_user
+
+    text = (
+        "📥 <b>DOWNLOAD LOG</b>\n\n"
+        f"👤 User ID: "
+        f"<code>{user.id}</code>\n"
+        f"👤 Username: "
+        f"@{user.username or 'N/A'}\n"
+        f"📁 File: "
+        f"<code>{result['filename']}</code>\n"
+        f"📌 Type: "
+        f"{detected}\n"
+        f"📦 Size: "
+        f"{result['size'] / 1024 / 1024:.2f} MB\n"
+        f"🔗 URL:\n"
+        f"<code>{url[:3000]}</code>"
+    )
+
+    try:
+
+        await context.bot.send_message(
+            channel_id,
+            text,
+            parse_mode="HTML"
+        )
+
+    except Exception as exc:
+
+        logger.error(
+            "Log channel error: %s",
+            exc
+        )
+
+
+async def send_error_log(
+    update,
+    context,
+    url,
+    error
+):
+
+    channel_id = log_channel_id()
+
+    if not channel_id:
+        return
+
+    user = update.effective_user
+
+    try:
+
+        await context.bot.send_message(
+            channel_id,
+            (
+                "❌ <b>DOWNLOAD ERROR</b>\n\n"
+                f"User: <code>{user.id}</code>\n"
+                f"URL:\n"
+                f"<code>{url[:3000]}</code>\n\n"
+                f"Error:\n"
+                f"<code>{str(error)[:1500]}</code>"
+            ),
+            parse_mode="HTML"
+        )
+
+    except Exception:
+        pass
+
+
+async def send_input_log(
+    update,
+    context,
+    input_type,
+    content
+):
+
+    channel_id = log_channel_id()
+
+    if not channel_id:
+        return
+
+    user = update.effective_user
+
+    try:
+
+        await context.bot.send_message(
+            channel_id,
+            (
+                f"📨 <b>{input_type}</b>\n\n"
+                f"User ID: <code>{user.id}</code>\n"
+                f"Username: @{user.username or 'N/A'}\n\n"
+                f"{content[:3500]}"
+            ),
+            parse_mode="HTML"
+        )
+
+    except Exception:
+        pass
+
+
+# ============================================================
+# TEXT
 # ============================================================
 
 async def handle_text(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    update,
+    context
 ):
+
     user = update.effective_user
 
-    upsert_user(user)
+    save_user(
+        user
+    )
 
-    text = update.message.text or ""
+    if not await require_force_join(
+        update,
+        context
+    ):
+        return
+
+    # Channel setup
+    if context.user_data.get(
+        "waiting_channel"
+    ):
+
+        value = (
+            update.message.text
+            or ""
+        ).strip()
+
+        await send_input_log(
+            update,
+            context,
+            "CHANNEL INPUT",
+            value
+        )
+
+        try:
+
+            chat = await context.bot.get_chat(
+                value
+            )
+
+            member = (
+                await context.bot.get_chat_member(
+                    chat.id,
+                    context.bot.id
+                )
+            )
+
+            if member.status not in {
+                "administrator",
+                "creator",
+            }:
+
+                await update.message.reply_text(
+                    "❌ Bot को channel में Administrator बनाएं।"
+                )
+
+                return
+
+            channels_col.update_one(
+                {
+                    "chat_id": chat.id
+                },
+                {
+                    "$set": {
+                        "chat_id": chat.id,
+                        "title": chat.title or "",
+                        "username": (
+                            chat.username or ""
+                        ),
+                        "owner_user_id": user.id,
+                        "added_at": int(
+                            time.time()
+                        ),
+                    }
+                },
+                upsert=True
+            )
+
+            context.user_data.pop(
+                "waiting_channel",
+                None
+            )
+
+            await update.message.reply_text(
+                (
+                    "✅ Channel successfully added.\n\n"
+                    f"Channel: {chat.title or 'N/A'}\n"
+                    f"ID: <code>{chat.id}</code>\n\n"
+                    "अब download के बाद file "
+                    "channel में भेजने का option "
+                    "admin configuration के अनुसार "
+                    "use किया जा सकता है।"
+                ),
+                parse_mode="HTML"
+            )
+
+        except Exception as exc:
+
+            await update.message.reply_text(
+                "❌ Channel add नहीं हुआ।\n\n"
+                "Bot को channel में Admin बनाकर "
+                "फिर channel username/ID भेजें।"
+            )
+
+            logger.warning(
+                "Channel setup: %s",
+                exc
+            )
+
+        return
 
     # Payment UTR
     if context.user_data.get(
         "proof_payment_id"
     ):
-        payment_id = context.user_data.pop(
-            "proof_payment_id"
-        )
 
-        payment = get_pending_payment(
-            payment_id
-        )
-
-        if payment and payment["user_id"] == user.id:
-
-            for admin_id in ADMIN_IDS:
-                try:
-                    await context.bot.send_message(
-                        chat_id=admin_id,
-                        text=(
-                            "🧾 <b>Payment UTR</b>\n\n"
-                            f"Payment ID: <code>{payment_id}</code>\n"
-                            f"User ID: <code>{user.id}</code>\n"
-                            f"UTR: <code>{text[:200]}</code>"
-                        ),
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
-
-            await update.message.reply_text(
-                "✅ UTR receive हो गया। Admin verification के बाद premium activate होगा।"
-            )
+        if await payment_utr(
+            update,
+            context
+        ):
 
             return
 
-    urls = extract_urls(text)
+    urls = extract_urls(
+        update.message.text
+    )
 
     if not urls:
+
         await update.message.reply_text(
-            "❌ कोई valid HTTP/HTTPS URL नहीं मिला।"
+            "❌ Valid HTTP/HTTPS URL नहीं मिला।"
         )
+
         return
 
     requested_type = context.user_data.get(
         "requested_type"
     )
 
-    if requested_type in {
-        "pdf",
-        "video",
-    } and not is_premium(user.id):
+    if not premium_active(
+        user.id
+    ):
 
         await update.message.reply_text(
-            "💎 यह feature Premium है।\n\n"
-            "Buy Premium खोलकर plan activate करें।",
+            "💎 यह download feature Premium है।",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
                         "💎 Buy Premium",
-                        callback_data="premium",
+                        callback_data="premium"
                     )
                 ]
-            ]),
+            ])
         )
 
         return
+
+    await send_input_log(
+        update,
+        context,
+        "URL INPUT",
+        "\n".join(urls)
+    )
 
     await update.message.reply_text(
         f"🔎 {len(urls)} link मिले।\n"
         "⏳ Download शुरू हो रहा है..."
     )
 
-    for index, url in enumerate(urls, 1):
+    for index, url in enumerate(
+        urls,
+        1
+    ):
 
         if len(urls) > 1:
+
             await update.message.reply_text(
                 f"📥 Processing {index}/{len(urls)}"
             )
 
-        success, result = await process_single_url(
+        success, result = await process_url(
             update,
             context,
             url,
-            requested_type,
+            requested_type
         )
 
         if not success:
 
-            if result == "premium_required":
-                await update.message.reply_text(
-                    "💎 Premium required."
-                )
-            else:
-                await update.message.reply_text(
-                    f"❌ Download failed:\n{result}"
-                )
+            await update.message.reply_text(
+                f"❌ Failed:\n{result}"
+            )
 
 
 # ============================================================
-# TXT FILE
+# TXT
 # ============================================================
 
-async def handle_document(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+async def handle_txt(
+    update,
+    context
 ):
+
     user = update.effective_user
 
-    upsert_user(user)
-
-    document = update.message.document
-
-    filename = (
-        document.file_name or ""
-    ).lower()
-
-    if not filename.endswith(".txt"):
-        await update.message.reply_text(
-            "❌ केवल TXT file भेजें।"
-        )
-        return
-
-    requested_type = context.user_data.get(
-        "requested_type"
+    save_user(
+        user
     )
 
-    if requested_type in {
-        "pdf",
-        "video",
-    } and not is_premium(user.id):
+    if not get_setting(
+        "txt_enabled",
+        True
+    ):
 
         await update.message.reply_text(
-            "💎 TXT batch download के लिए Premium required है।",
+            "❌ TXT batch download disabled है।"
+        )
+
+        return
+
+    if not await require_force_join(
+        update,
+        context
+    ):
+        return
+
+    if not premium_active(
+        user.id
+    ):
+
+        await update.message.reply_text(
+            "💎 TXT batch download Premium feature है।",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
                         "💎 Buy Premium",
-                        callback_data="premium",
+                        callback_data="premium"
                     )
                 ]
-            ]),
+            ])
         )
 
         return
 
+    filename = (
+        update.message.document.file_name
+        or ""
+    )
+
+    if not filename.lower().endswith(
+        ".txt"
+    ):
+
+        await update.message.reply_text(
+            "❌ केवल TXT file भेजें।"
+        )
+
+        return
+
+    await send_input_log(
+        update,
+        context,
+        "TXT FILE",
+        filename
+    )
+
     temp_path = (
         DOWNLOAD_DIR
-        / f"{uuid.uuid4().hex}.txt"
+        /
+        f"{uuid.uuid4().hex}.txt"
     )
 
     try:
-        tg_file = await document.get_file()
+
+        tg_file = await (
+            update.message.document
+            .get_file()
+        )
 
         await tg_file.download_to_drive(
-            custom_path=str(temp_path)
+            custom_path=str(
+                temp_path
+            )
         )
 
         async with aiofiles.open(
             temp_path,
             "r",
             encoding="utf-8",
-            errors="ignore",
+            errors="ignore"
         ) as file:
+
             text = await file.read()
 
-        urls = extract_urls(text)
+        urls = extract_urls(
+            text
+        )
 
         if not urls:
+
             await update.message.reply_text(
-                "❌ TXT file में कोई valid URL नहीं मिला।"
+                "❌ TXT में कोई valid URL नहीं मिला।"
             )
+
             return
 
         await update.message.reply_text(
-            f"📋 {len(urls)} links मिले।\n"
-            "⏳ Batch download शुरू हो रहा है..."
+            f"📋 {len(urls)} links मिले।"
         )
 
         for index, url in enumerate(
             urls,
             1
         ):
+
             await update.message.reply_text(
                 f"📥 {index}/{len(urls)}"
             )
 
-            success, result = await process_single_url(
+            requested_type = context.user_data.get(
+                "requested_type"
+            )
+
+            await process_url(
                 update,
                 context,
                 url,
-                requested_type,
+                requested_type
             )
 
-            if not success:
-                await update.message.reply_text(
-                    f"❌ Link {index} failed:\n{result}"
-                )
-
     except Exception as exc:
+
         logger.exception(
-            "TXT error"
+            "TXT processing error"
         )
 
         await update.message.reply_text(
-            f"❌ TXT processing error:\n{exc}"
+            f"❌ TXT error:\n{exc}"
         )
 
     finally:
+
         try:
             temp_path.unlink()
         except Exception:
@@ -1665,97 +2602,135 @@ async def handle_document(
 
 
 # ============================================================
-# ADMIN COMMANDS
+# ADMIN COMMAND
 # ============================================================
 
-def admin_only(user_id):
+def is_admin(
+    user_id
+):
+
     return user_id in ADMIN_IDS
 
 
-async def admin_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+async def admin(
+    update,
+    context
 ):
-    if not admin_only(
+
+    if not is_admin(
         update.effective_user.id
     ):
+
         await update.message.reply_text(
             "❌ Unauthorized"
         )
+
         return
 
     await update.message.reply_text(
-        "👨‍💻 <b>Admin Panel</b>\n\n"
-        "/stats - Statistics\n"
-        "/setwelcome - Welcome text\n"
-        "/sethelp - Help text\n"
-        "/setpdfprice - PDF premium price\n"
-        "/setvideoprice - Video premium price\n"
-        "/setdays - Premium days\n"
-        "/setupi - UPI ID\n"
-        "/setpayment - Payment instructions\n"
-        "/setwelcomeimage - Welcome image\n"
-        "/users - Users\n",
-        parse_mode="HTML",
+        (
+            "👨‍💻 <b>ADMIN PANEL</b>\n\n"
+
+            "📊 /stats\n"
+
+            "🏠 /setwelcome TEXT\n"
+            "🆘 /sethelp TEXT\n"
+
+            "💰 /setpdfprice NUMBER\n"
+            "💰 /setvideoprice NUMBER\n"
+            "⏳ /setdays NUMBER\n"
+            "💳 /setupi UPI\n"
+            "/setpayment TEXT\n"
+
+            "🔒 /forcejoin on|off\n"
+            "/addforcejoin CHAT_ID INVITE_URL\n"
+            "/removeforcejoin CHAT_ID\n"
+
+            "📄 /pdf on|off\n"
+            "🎥 /video on|off\n"
+            "📋 /txt on|off\n"
+
+            "📢 /channelupload on|off\n"
+            "🛠 /maintenance on|off\n"
+
+            "🖼 /setwelcomeimage\n"
+
+            "👤 /premium USER_ID DAYS\n"
+            "🚫 /removePremium USER_ID\n"
+
+            "📢 /channels\n"
+            "/removechannel CHAT_ID\n\n"
+
+            "💡 Welcome image बदलने के लिए:\n"
+            "/setwelcomeimage भेजें और फिर image भेजें।"
+        ),
+        parse_mode="HTML"
     )
 
 
-async def stats_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+# ============================================================
+# ADMIN STATS
+# ============================================================
+
+async def stats(
+    update,
+    context
 ):
-    if not admin_only(
+
+    if not is_admin(
         update.effective_user.id
     ):
         return
 
-    con = db()
+    users = users_col.count_documents({})
 
-    users = con.execute(
-        "SELECT COUNT(*) AS c FROM users"
-    ).fetchone()["c"]
+    premium = users_col.count_documents({
+        "premium": True,
+        "premium_until": {
+            "$gt": int(
+                time.time()
+            )
+        }
+    })
 
-    premium = con.execute(
-        """
-        SELECT COUNT(*) AS c
-        FROM users
-        WHERE premium=1
-        AND premium_until>?
-        """,
-        (int(time.time()),),
-    ).fetchone()["c"]
+    downloads = downloads_col.count_documents({})
 
-    downloads = con.execute(
-        "SELECT COUNT(*) AS c FROM downloads"
-    ).fetchone()["c"]
+    success = downloads_col.count_documents({
+        "status": "success"
+    })
 
-    pending = con.execute(
-        """
-        SELECT COUNT(*) AS c
-        FROM payments
-        WHERE status='pending'
-        """
-    ).fetchone()["c"]
+    pending = payments_col.count_documents({
+        "status": "pending"
+    })
 
-    con.close()
+    approved = payments_col.count_documents({
+        "status": "approved"
+    })
 
     await update.message.reply_text(
         (
-            "📊 <b>Statistics</b>\n\n"
+            "📊 <b>BOT STATISTICS</b>\n\n"
             f"👥 Users: {users}\n"
-            f"💎 Premium: {premium}\n"
+            f"💎 Active Premium: {premium}\n"
             f"📥 Downloads: {downloads}\n"
-            f"💳 Pending Payments: {pending}"
+            f"✅ Successful: {success}\n"
+            f"💳 Pending Payments: {pending}\n"
+            f"💰 Approved Payments: {approved}"
         ),
-        parse_mode="HTML",
+        parse_mode="HTML"
     )
 
 
-async def setwelcome_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+# ============================================================
+# ADMIN SETTERS
+# ============================================================
+
+async def setwelcome(
+    update,
+    context
 ):
-    if not admin_only(
+
+    if not is_admin(
         update.effective_user.id
     ):
         return
@@ -1765,9 +2740,11 @@ async def setwelcome_command(
     ].strip()
 
     if not text:
+
         await update.message.reply_text(
-            "Usage:\n/setwelcome आपका message"
+            "/setwelcome आपका welcome message"
         )
+
         return
 
     set_setting(
@@ -1780,11 +2757,12 @@ async def setwelcome_command(
     )
 
 
-async def sethelp_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+async def sethelp(
+    update,
+    context
 ):
-    if not admin_only(
+
+    if not is_admin(
         update.effective_user.id
     ):
         return
@@ -1794,9 +2772,11 @@ async def sethelp_command(
     ].strip()
 
     if not text:
+
         await update.message.reply_text(
-            "Usage:\n/sethelp आपका help message"
+            "/sethelp आपका help message"
         )
+
         return
 
     set_setting(
@@ -1809,144 +2789,12 @@ async def sethelp_command(
     )
 
 
-async def setprice_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    key,
-    usage,
+async def setpayment(
+    update,
+    context
 ):
-    if not admin_only(
-        update.effective_user.id
-    ):
-        return
 
-    parts = update.message.text.split()
-
-    if len(parts) != 2:
-        await update.message.reply_text(
-            usage
-        )
-        return
-
-    try:
-        price = int(parts[1])
-
-        if price < 0:
-            raise ValueError
-
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Invalid price."
-        )
-        return
-
-    set_setting(
-        key,
-        price
-    )
-
-    await update.message.reply_text(
-        f"✅ Price updated: ₹{price}"
-    )
-
-
-async def setpdfprice_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    await setprice_command(
-        update,
-        context,
-        "pdf_price",
-        "/setpdfprice 49",
-    )
-
-
-async def setvideoprice_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    await setprice_command(
-        update,
-        context,
-        "video_price",
-        "/setvideoprice 99",
-    )
-
-
-async def setdays_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not admin_only(
-        update.effective_user.id
-    ):
-        return
-
-    parts = update.message.text.split()
-
-    if len(parts) != 2:
-        await update.message.reply_text(
-            "/setdays 30"
-        )
-        return
-
-    try:
-        days = int(parts[1])
-
-        if days <= 0:
-            raise ValueError
-
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Invalid days."
-        )
-        return
-
-    set_setting(
-        "premium_days",
-        days
-    )
-
-    await update.message.reply_text(
-        f"✅ Premium validity: {days} days"
-    )
-
-
-async def setupi_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not admin_only(
-        update.effective_user.id
-    ):
-        return
-
-    upi = update.message.text[
-        len("/setupi"):
-    ].strip()
-
-    if not upi:
-        await update.message.reply_text(
-            "/setupi yourupi@upi"
-        )
-        return
-
-    set_setting(
-        "upi_id",
-        upi
-    )
-
-    await update.message.reply_text(
-        "✅ UPI ID updated."
-    )
-
-
-async def setpayment_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not admin_only(
+    if not is_admin(
         update.effective_user.id
     ):
         return
@@ -1954,12 +2802,6 @@ async def setpayment_command(
     text = update.message.text[
         len("/setpayment"):
     ].strip()
-
-    if not text:
-        await update.message.reply_text(
-            "/setpayment Payment instructions..."
-        )
-        return
 
     set_setting(
         "payment_text",
@@ -1971,11 +2813,443 @@ async def setpayment_command(
     )
 
 
-async def setwelcomeimage_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+async def setupi(
+    update,
+    context
 ):
-    if not admin_only(
+
+    if not is_admin(
+        update.effective_user.id
+    ):
+        return
+
+    parts = update.message.text.split(
+        maxsplit=1
+    )
+
+    if len(parts) != 2:
+
+        await update.message.reply_text(
+            "/setupi yourupi@upi"
+        )
+
+        return
+
+    set_setting(
+        "upi_id",
+        parts[1].strip()
+    )
+
+    await update.message.reply_text(
+        "✅ UPI updated."
+    )
+
+
+async def set_pdf_price(
+    update,
+    context
+):
+
+    await set_numeric_setting(
+        update,
+        "pdf_price",
+        "/setpdfprice 49"
+    )
+
+
+async def set_video_price(
+    update,
+    context
+):
+
+    await set_numeric_setting(
+        update,
+        "video_price",
+        "/setvideoprice 99"
+    )
+
+
+async def set_days(
+    update,
+    context
+):
+
+    await set_numeric_setting(
+        update,
+        "premium_days",
+        "/setdays 30"
+    )
+
+
+async def set_numeric_setting(
+    update,
+    key,
+    usage
+):
+
+    if not is_admin(
+        update.effective_user.id
+    ):
+        return
+
+    parts = update.message.text.split()
+
+    if len(parts) != 2:
+
+        await update.message.reply_text(
+            usage
+        )
+
+        return
+
+    try:
+
+        value = int(
+            parts[1]
+        )
+
+        if value < 0:
+            raise ValueError
+
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ Invalid number."
+        )
+
+        return
+
+    set_setting(
+        key,
+        value
+    )
+
+    await update.message.reply_text(
+        f"✅ {key} = {value}"
+    )
+
+
+# ============================================================
+# TOGGLE
+# ============================================================
+
+async def toggle_setting(
+    update,
+    key,
+    usage
+):
+
+    if not is_admin(
+        update.effective_user.id
+    ):
+        return
+
+    parts = update.message.text.split()
+
+    if len(parts) != 2:
+
+        await update.message.reply_text(
+            usage
+        )
+
+        return
+
+    value = (
+        parts[1].lower()
+        == "on"
+    )
+
+    set_setting(
+        key,
+        value
+    )
+
+    await update.message.reply_text(
+        f"✅ {key}: "
+        f"{'ON' if value else 'OFF'}"
+    )
+
+
+async def forcejoin_toggle(
+    update,
+    context
+):
+
+    await toggle_setting(
+        update,
+        "force_join_enabled",
+        "/forcejoin on|off"
+    )
+
+
+async def pdf_toggle(
+    update,
+    context
+):
+
+    await toggle_setting(
+        update,
+        "download_pdf_enabled",
+        "/pdf on|off"
+    )
+
+
+async def video_toggle(
+    update,
+    context
+):
+
+    await toggle_setting(
+        update,
+        "download_video_enabled",
+        "/video on|off"
+    )
+
+
+async def txt_toggle(
+    update,
+    context
+):
+
+    await toggle_setting(
+        update,
+        "txt_enabled",
+        "/txt on|off"
+    )
+
+
+async def channel_upload_toggle(
+    update,
+    context
+):
+
+    await toggle_setting(
+        update,
+        "channel_upload_enabled",
+        "/channelupload on|off"
+    )
+
+
+async def maintenance_toggle(
+    update,
+    context
+):
+
+    await toggle_setting(
+        update,
+        "maintenance",
+        "/maintenance on|off"
+    )
+
+
+# ============================================================
+# FORCE JOIN CHANNELS
+# ============================================================
+
+async def add_force_join(
+    update,
+    context
+):
+
+    if not is_admin(
+        update.effective_user.id
+    ):
+        return
+
+    parts = update.message.text.split(
+        maxsplit=2
+    )
+
+    if len(parts) != 3:
+
+        await update.message.reply_text(
+            "/addforcejoin CHAT_ID INVITE_URL"
+        )
+
+        return
+
+    try:
+
+        chat_id = int(
+            parts[1]
+        )
+
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ Invalid CHAT_ID"
+        )
+
+        return
+
+    invite = parts[2].strip()
+
+    channels = get_setting(
+        "force_join_channels",
+        []
+    )
+
+    channels = [
+        x
+        for x in channels
+        if x.get(
+            "chat_id"
+        ) != chat_id
+    ]
+
+    channels.append({
+        "chat_id": chat_id,
+        "invite": invite,
+    })
+
+    set_setting(
+        "force_join_channels",
+        channels
+    )
+
+    await update.message.reply_text(
+        "✅ Force join channel added."
+    )
+
+
+async def remove_force_join(
+    update,
+    context
+):
+
+    if not is_admin(
+        update.effective_user.id
+    ):
+        return
+
+    parts = update.message.text.split()
+
+    if len(parts) != 2:
+        return
+
+    try:
+        chat_id = int(
+            parts[1]
+        )
+    except ValueError:
+        return
+
+    channels = get_setting(
+        "force_join_channels",
+        []
+    )
+
+    channels = [
+        x
+        for x in channels
+        if x.get(
+            "chat_id"
+        ) != chat_id
+    ]
+
+    set_setting(
+        "force_join_channels",
+        channels
+    )
+
+    await update.message.reply_text(
+        "✅ Force join channel removed."
+    )
+
+
+# ============================================================
+# PREMIUM MANUAL ADMIN
+# ============================================================
+
+async def manual_premium(
+    update,
+    context
+):
+
+    if not is_admin(
+        update.effective_user.id
+    ):
+        return
+
+    parts = update.message.text.split()
+
+    if len(parts) != 3:
+
+        await update.message.reply_text(
+            "/premium USER_ID DAYS"
+        )
+
+        return
+
+    try:
+
+        user_id = int(
+            parts[1]
+        )
+
+        days = int(
+            parts[2]
+        )
+
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ Invalid values."
+        )
+
+        return
+
+    activate_premium(
+        user_id,
+        days
+    )
+
+    await update.message.reply_text(
+        "✅ Premium activated."
+    )
+
+
+async def remove_premium(
+    update,
+    context
+):
+
+    if not is_admin(
+        update.effective_user.id
+    ):
+        return
+
+    parts = update.message.text.split()
+
+    if len(parts) != 2:
+        return
+
+    try:
+        user_id = int(
+            parts[1]
+        )
+    except ValueError:
+        return
+
+    deactivate_premium(
+        user_id
+    )
+
+    await update.message.reply_text(
+        "✅ Premium removed."
+    )
+
+
+# ============================================================
+# WELCOME IMAGE
+# ============================================================
+
+async def setwelcomeimage(
+    update,
+    context
+):
+
+    if not is_admin(
         update.effective_user.id
     ):
         return
@@ -1989,33 +3263,43 @@ async def setwelcomeimage_command(
     )
 
 
-# ============================================================
-# ADMIN PHOTO
-# ============================================================
-
-async def handle_admin_photo(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+async def admin_photo(
+    update,
+    context
 ):
-    if update.effective_user.id not in ADMIN_IDS:
+
+    if not is_admin(
+        update.effective_user.id
+    ):
         return
 
     if not context.user_data.get(
         "waiting_welcome_image"
     ):
+
         return
 
     photo = update.message.photo[-1]
 
     tg_file = await photo.get_file()
 
+    for old in WELCOME_DIR.glob("*"):
+
+        try:
+            old.unlink()
+        except Exception:
+            pass
+
     target = (
         WELCOME_DIR
-        / "welcome.jpg"
+        /
+        "welcome.jpg"
     )
 
     await tg_file.download_to_drive(
-        custom_path=str(target)
+        custom_path=str(
+            target
+        )
     )
 
     context.user_data.pop(
@@ -2029,129 +3313,220 @@ async def handle_admin_photo(
 
 
 # ============================================================
-# ADMIN WEB PANEL
+# USER CHANNELS
 # ============================================================
 
-app = Flask(__name__)
+async def channels(
+    update,
+    context
+):
 
-app.secret_key = SECRET_KEY
+    if not is_admin(
+        update.effective_user.id
+    ):
+        return
+
+    items = list(
+        channels_col.find(
+            {}
+        )
+    )
+
+    if not items:
+
+        await update.message.reply_text(
+            "No channels."
+        )
+
+        return
+
+    text = "📢 <b>CHANNELS</b>\n\n"
+
+    for item in items:
+
+        text += (
+            f"• {item.get('title','')}\n"
+            f"  ID: <code>{item['chat_id']}</code>\n"
+            f"  Owner: {item.get('owner_user_id')}\n\n"
+        )
+
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML"
+    )
+
+
+async def remove_channel(
+    update,
+    context
+):
+
+    if not is_admin(
+        update.effective_user.id
+    ):
+        return
+
+    parts = update.message.text.split()
+
+    if len(parts) != 2:
+        return
+
+    try:
+        chat_id = int(
+            parts[1]
+        )
+    except ValueError:
+        return
+
+    channels_col.delete_one(
+        {
+            "chat_id": chat_id
+        }
+    )
+
+    await update.message.reply_text(
+        "✅ Channel removed."
+    )
+
+
+# ============================================================
+# FLASK ADMIN PANEL
+# ============================================================
+
+web_app = Flask(
+    __name__
+)
+
+web_app.secret_key = SECRET_KEY
 
 
 ADMIN_HTML = """
 <!doctype html>
-<html lang="en">
+<html lang="hi">
 <head>
 <meta charset="utf-8">
 <meta name="viewport"
       content="width=device-width,initial-scale=1">
-<title>Downloader Admin</title>
+<title>Downloader Admin Panel</title>
 <style>
 *{
-box-sizing:border-box;
+box-sizing:border-box
 }
 body{
 margin:0;
 font-family:Arial,sans-serif;
-background:#080b12;
-color:#fff;
+background:#070a10;
+color:#fff
 }
 .wrap{
-max-width:1000px;
+max-width:1100px;
 margin:auto;
-padding:20px;
+padding:20px
 }
 .card{
-background:#111722;
-border:1px solid #273044;
+background:#101620;
+border:1px solid #273142;
 border-radius:16px;
 padding:18px;
-margin-bottom:15px;
+margin-bottom:15px
 }
-h1,h2{
-margin-top:0;
+.grid{
+display:grid;
+grid-template-columns:
+repeat(auto-fit,minmax(220px,1fr));
+gap:12px
 }
-input,textarea,button{
+.stat{
+font-size:30px;
+font-weight:800
+}
+input,textarea,select{
 width:100%;
 padding:12px;
 margin-top:8px;
 border-radius:10px;
 border:1px solid #303b4d;
 background:#080d14;
-color:#fff;
+color:#fff
 }
 textarea{
-min-height:130px;
-resize:vertical;
+min-height:120px;
+resize:vertical
 }
 button{
-background:#4777ff;
+width:100%;
+padding:12px;
+margin-top:12px;
 border:0;
-font-weight:bold;
-cursor:pointer;
-}
-.grid{
-display:grid;
-grid-template-columns:
-repeat(auto-fit,minmax(220px,1fr));
-gap:12px;
-}
-.stat{
-font-size:28px;
-font-weight:bold;
+border-radius:10px;
+background:#4777ff;
+color:#fff;
+font-weight:700;
+cursor:pointer
 }
 label{
 display:block;
 margin-top:12px;
 font-size:13px;
-color:#9da8ba;
-}
-a{
-color:#7ea0ff;
+color:#aab4c4
 }
 </style>
 </head>
+
 <body>
 
 <div class="wrap">
 
 <div class="card">
-<h1>👨‍💻 Downloader Admin</h1>
-<p>Premium PDF + Video Downloader</p>
+<h1>👨‍💻 Downloader Admin Panel</h1>
+<p>MongoDB Persistent Control Panel</p>
 </div>
 
 <div class="grid">
 
 <div class="card">
-<div>Users</div>
-<div class="stat">{{stats.users}}</div>
+Users
+<div class="stat">
+{{stats.users}}
+</div>
 </div>
 
 <div class="card">
-<div>Premium Users</div>
-<div class="stat">{{stats.premium}}</div>
+Premium
+<div class="stat">
+{{stats.premium}}
+</div>
 </div>
 
 <div class="card">
-<div>Downloads</div>
-<div class="stat">{{stats.downloads}}</div>
+Downloads
+<div class="stat">
+{{stats.downloads}}
+</div>
 </div>
 
 <div class="card">
-<div>Pending Payments</div>
-<div class="stat">{{stats.pending}}</div>
+Pending Payments
+<div class="stat">
+{{stats.pending}}
+</div>
 </div>
 
 </div>
 
-<form method="post"
-      action="/admin/save">
+<form
+method="post"
+action="/admin/save">
 
 <div class="card">
 
 <h2>🏠 Welcome</h2>
 
 <label>Welcome Message</label>
-<textarea name="welcome_text">{{settings.welcome_text}}</textarea>
+
+<textarea
+name="welcome_text"
+>{{settings.welcome_text}}</textarea>
 
 </div>
 
@@ -2160,7 +3535,10 @@ color:#7ea0ff;
 <h2>🆘 Help</h2>
 
 <label>Help Message</label>
-<textarea name="help_text">{{settings.help_text}}</textarea>
+
+<textarea
+name="help_text"
+>{{settings.help_text}}</textarea>
 
 </div>
 
@@ -2169,29 +3547,158 @@ color:#7ea0ff;
 <h2>💎 Premium</h2>
 
 <label>PDF Price</label>
-<input type="number"
-       name="pdf_price"
-       value="{{settings.pdf_price}}">
+
+<input
+type="number"
+name="pdf_price"
+value="{{settings.pdf_price}}">
 
 <label>Video Price</label>
-<input type="number"
-       name="video_price"
-       value="{{settings.video_price}}">
+
+<input
+type="number"
+name="video_price"
+value="{{settings.video_price}}">
 
 <label>Premium Days</label>
-<input type="number"
-       name="premium_days"
-       value="{{settings.premium_days}}">
+
+<input
+type="number"
+name="premium_days"
+value="{{settings.premium_days}}">
 
 <label>UPI ID</label>
-<input name="upi_id"
-       value="{{settings.upi_id}}">
+
+<input
+name="upi_id"
+value="{{settings.upi_id}}">
 
 <label>Payment Instructions</label>
-<textarea name="payment_text">{{settings.payment_text}}</textarea>
 
-<button type="submit">
-💾 Save Settings
+<textarea
+name="payment_text"
+>{{settings.payment_text}}</textarea>
+
+<button>
+💾 Save Premium Settings
+</button>
+
+</div>
+
+<div class="card">
+
+<h2>⚙️ Features</h2>
+
+<label>
+PDF Download
+<select name="download_pdf_enabled">
+<option
+value="1"
+{% if settings.download_pdf_enabled %}
+selected
+{% endif %}
+>ON</option>
+<option
+value="0"
+{% if not settings.download_pdf_enabled %}
+selected
+{% endif %}
+>OFF</option>
+</select>
+</label>
+
+<label>
+Video Download
+<select name="download_video_enabled">
+<option
+value="1"
+{% if settings.download_video_enabled %}
+selected
+{% endif %}
+>ON</option>
+<option
+value="0"
+{% if not settings.download_video_enabled %}
+selected
+{% endif %}
+>OFF</option>
+</select>
+</label>
+
+<label>
+TXT Download
+<select name="txt_enabled">
+<option
+value="1"
+{% if settings.txt_enabled %}
+selected
+{% endif %}
+>ON</option>
+<option
+value="0"
+{% if not settings.txt_enabled %}
+selected
+{% endif %}
+>OFF</option>
+</select>
+</label>
+
+<label>
+Channel Upload
+<select name="channel_upload_enabled">
+<option
+value="1"
+{% if settings.channel_upload_enabled %}
+selected
+{% endif %}
+>ON</option>
+<option
+value="0"
+{% if not settings.channel_upload_enabled %}
+selected
+{% endif %}
+>OFF</option>
+</select>
+</label>
+
+<label>
+Force Join
+<select name="force_join_enabled">
+<option
+value="1"
+{% if settings.force_join_enabled %}
+selected
+{% endif %}
+>ON</option>
+<option
+value="0"
+{% if not settings.force_join_enabled %}
+selected
+{% endif %}
+>OFF</option>
+</select>
+</label>
+
+<label>
+Maintenance
+<select name="maintenance">
+<option
+value="1"
+{% if settings.maintenance %}
+selected
+{% endif %}
+>ON</option>
+<option
+value="0"
+{% if not settings.maintenance %}
+selected
+{% endif %}
+>OFF</option>
+</select>
+</label>
+
+<button>
+💾 Save Feature Settings
 </button>
 
 </div>
@@ -2202,20 +3709,58 @@ color:#7ea0ff;
 
 <h2>🖼 Welcome Image</h2>
 
-<form method="post"
-      action="/admin/upload"
-      enctype="multipart/form-data">
+<form
+method="post"
+action="/admin/upload"
+enctype="multipart/form-data">
 
-<input type="file"
-       name="image"
-       accept="image/*"
-       required>
+<input
+type="file"
+name="image"
+accept="image/*"
+required>
 
-<button type="submit">
-Upload / Change Image
+<button>
+Upload / Change Welcome Image
 </button>
 
 </form>
+
+</div>
+
+<div class="card">
+
+<h2>📢 Force Join Channels</h2>
+
+<form
+method="post"
+action="/admin/forcejoin">
+
+<input
+name="chat_id"
+placeholder="Channel ID"
+required>
+
+<input
+name="invite"
+placeholder="https://t.me/..."
+required>
+
+<button>
+Add Force Join Channel
+</button>
+
+</form>
+
+</div>
+
+<div class="card">
+
+<h2>🚪 Logout</h2>
+
+<a href="/admin/logout">
+Logout
+</a>
 
 </div>
 
@@ -2226,63 +3771,13 @@ Upload / Change Image
 """
 
 
-def web_admin():
-    if not session.get("admin"):
-        return redirect("/admin/login")
-
-    con = db()
-
-    stats = {
-        "users": con.execute(
-            "SELECT COUNT(*) AS c FROM users"
-        ).fetchone()["c"],
-
-        "premium": con.execute(
-            """
-            SELECT COUNT(*) AS c
-            FROM users
-            WHERE premium=1
-            AND premium_until>?
-            """,
-            (int(time.time()),),
-        ).fetchone()["c"],
-
-        "downloads": con.execute(
-            "SELECT COUNT(*) AS c FROM downloads"
-        ).fetchone()["c"],
-
-        "pending": con.execute(
-            """
-            SELECT COUNT(*) AS c
-            FROM payments
-            WHERE status='pending'
-            """
-        ).fetchone()["c"],
-    }
-
-    con.close()
-
-    settings = {
-        key: get_setting(key)
-        for key in [
-            "welcome_text",
-            "help_text",
-            "pdf_price",
-            "video_price",
-            "premium_days",
-            "upi_id",
-            "payment_text",
-        ]
-    }
-
-    return render_template_string(
-        ADMIN_HTML,
-        stats=stats,
-        settings=settings,
-    )
-
-
-@app.route("/admin/login", methods=["GET", "POST"])
+@web_app.route(
+    "/admin/login",
+    methods=[
+        "GET",
+        "POST"
+    ]
+)
 def admin_login():
 
     if request.method == "POST":
@@ -2292,97 +3787,206 @@ def admin_login():
             ""
         )
 
-        # Admin panel password:
-        # use SECRET_KEY as initial password
         if password == SECRET_KEY:
 
-            session["admin"] = True
+            session[
+                "admin"
+            ] = True
 
             return redirect(
                 "/admin"
             )
 
-        return """
-        <h3>Invalid password</h3>
-        <a href="/admin/login">
-        Try again
-        </a>
-        """
+        return (
+            "Invalid password"
+        )
 
     return """
-    <!doctype html>
-    <html>
-    <body style="
-    background:#080b12;
-    color:white;
-    font-family:Arial;
-    padding:30px;
-    ">
-    <h2>Admin Login</h2>
+<!doctype html>
+<html>
+<body style="
+background:#080b12;
+color:white;
+font-family:Arial;
+padding:30px;
+">
 
-    <form method="post">
+<h2>Admin Login</h2>
 
-    <input
-    type="password"
-    name="password"
-    placeholder="Admin password"
-    style="
-    padding:12px;
-    width:300px;
-    background:#111722;
-    color:white;
-    border:1px solid #303b4d;
-    border-radius:10px;
-    ">
+<form method="post">
 
-    <button
-    style="
-    padding:12px;
-    margin-top:10px;
-    ">
-    Login
-    </button>
+<input
+type="password"
+name="password"
+placeholder="Admin password"
+style="
+padding:12px;
+width:300px;
+background:#111722;
+color:white;
+">
 
-    </form>
+<br>
 
-    </body>
-    </html>
-    """
+<button
+style="
+padding:12px;
+margin-top:10px;
+">
+Login
+</button>
+
+</form>
+
+</body>
+</html>
+"""
 
 
-@app.route("/admin")
+@web_app.route(
+    "/admin"
+)
 def admin_page():
-    return web_admin()
 
+    if not session.get(
+        "admin"
+    ):
 
-@app.route("/admin/save", methods=["POST"])
-def admin_save():
-
-    if not session.get("admin"):
         return redirect(
             "/admin/login"
         )
 
-    fields = [
+    stats_data = {
+
+        "users":
+            users_col.count_documents({}),
+
+        "premium":
+            users_col.count_documents({
+                "premium": True,
+                "premium_until": {
+                    "$gt": int(
+                        time.time()
+                    )
+                }
+            }),
+
+        "downloads":
+            downloads_col.count_documents({}),
+
+        "pending":
+            payments_col.count_documents({
+                "status": "pending"
+            }),
+    }
+
+    keys = [
         "welcome_text",
         "help_text",
+        "payment_text",
+        "upi_id",
         "pdf_price",
         "video_price",
         "premium_days",
-        "upi_id",
-        "payment_text",
+        "download_pdf_enabled",
+        "download_video_enabled",
+        "txt_enabled",
+        "channel_upload_enabled",
+        "force_join_enabled",
+        "maintenance",
     ]
 
-    for field in fields:
+    settings = {
+        key:
+            get_setting(
+                key
+            )
+        for key in keys
+    }
 
-        value = request.form.get(
+    return render_template_string(
+        ADMIN_HTML,
+        stats=stats_data,
+        settings=settings
+    )
+
+
+@web_app.route(
+    "/admin/save",
+    methods=["POST"]
+)
+def admin_save():
+
+    if not session.get(
+        "admin"
+    ):
+
+        return redirect(
+            "/admin/login"
+        )
+
+    text_fields = [
+        "welcome_text",
+        "help_text",
+        "payment_text",
+        "upi_id",
+    ]
+
+    for field in text_fields:
+
+        set_setting(
             field,
-            ""
-        ).strip()
+            request.form.get(
+                field,
+                ""
+            ).strip()
+        )
+
+    numeric_fields = [
+        "pdf_price",
+        "video_price",
+        "premium_days",
+    ]
+
+    for field in numeric_fields:
+
+        try:
+
+            value = int(
+                request.form.get(
+                    field,
+                    "0"
+                )
+            )
+
+            if value < 0:
+                value = 0
+
+        except ValueError:
+
+            value = 0
 
         set_setting(
             field,
             value
+        )
+
+    boolean_fields = [
+        "download_pdf_enabled",
+        "download_video_enabled",
+        "txt_enabled",
+        "channel_upload_enabled",
+        "force_join_enabled",
+        "maintenance",
+    ]
+
+    for field in boolean_fields:
+
+        set_setting(
+            field,
+            request.form.get(
+                field
+            ) == "1"
         )
 
     return redirect(
@@ -2390,13 +3994,16 @@ def admin_save():
     )
 
 
-@app.route(
+@web_app.route(
     "/admin/upload",
     methods=["POST"]
 )
 def admin_upload():
 
-    if not session.get("admin"):
+    if not session.get(
+        "admin"
+    ):
+
         return redirect(
             "/admin/login"
         )
@@ -2406,31 +4013,41 @@ def admin_upload():
     )
 
     if not image:
+
         return redirect(
             "/admin"
         )
 
-    for old in WELCOME_DIR.glob("*"):
-        try:
-            old.unlink()
-        except Exception:
-            pass
+    extension = (
+        Path(
+            image.filename
+            or
+            "welcome.jpg"
+        ).suffix.lower()
+    )
 
-    ext = Path(
-        image.filename or "welcome.jpg"
-    ).suffix.lower()
-
-    if ext not in {
+    if extension not in {
         ".jpg",
         ".jpeg",
         ".png",
         ".webp",
     }:
-        ext = ".jpg"
+
+        return (
+            "Invalid image"
+        )
+
+    for old in WELCOME_DIR.glob("*"):
+
+        try:
+            old.unlink()
+        except Exception:
+            pass
 
     image.save(
         WELCOME_DIR
-        / f"welcome{ext}"
+        /
+        f"welcome{extension}"
     )
 
     return redirect(
@@ -2438,7 +4055,70 @@ def admin_upload():
     )
 
 
-@app.route("/admin/logout")
+@web_app.route(
+    "/admin/forcejoin",
+    methods=["POST"]
+)
+def admin_forcejoin():
+
+    if not session.get(
+        "admin"
+    ):
+
+        return redirect(
+            "/admin/login"
+        )
+
+    try:
+
+        chat_id = int(
+            request.form[
+                "chat_id"
+            ]
+        )
+
+    except Exception:
+
+        return redirect(
+            "/admin"
+        )
+
+    invite = request.form.get(
+        "invite",
+        ""
+    ).strip()
+
+    channels = get_setting(
+        "force_join_channels",
+        []
+    )
+
+    channels = [
+        x
+        for x in channels
+        if x.get(
+            "chat_id"
+        ) != chat_id
+    ]
+
+    channels.append({
+        "chat_id": chat_id,
+        "invite": invite,
+    })
+
+    set_setting(
+        "force_join_channels",
+        channels
+    )
+
+    return redirect(
+        "/admin"
+    )
+
+
+@web_app.route(
+    "/admin/logout"
+)
 def admin_logout():
 
     session.clear()
@@ -2449,29 +4129,31 @@ def admin_logout():
 
 
 # ============================================================
-# FLASK THREAD
+# WEB SERVER
 # ============================================================
 
 def run_web():
-    app.run(
+
+    web_app.run(
         host="0.0.0.0",
         port=PORT,
         debug=False,
-        use_reloader=False,
+        use_reloader=False
     )
 
 
 # ============================================================
-# ERROR HANDLER
+# ERROR
 # ============================================================
 
 async def error_handler(
     update,
     context
 ):
+
     logger.exception(
         "Unhandled bot error",
-        exc_info=context.error,
+        exc_info=context.error
     )
 
 
@@ -2479,159 +4161,239 @@ async def error_handler(
 # MAIN
 # ============================================================
 
-async def post_init(
-    application
-):
-    await application.bot.set_my_commands([
-        ("start", "Open downloader"),
-        ("admin", "Admin panel"),
-    ])
-
-
 def main():
 
     if not BOT_TOKEN:
         raise RuntimeError(
-            "BOT_TOKEN is missing"
+            "BOT_TOKEN missing"
         )
-
-    init_db()
 
     import threading
 
-    web_thread = threading.Thread(
+    thread = threading.Thread(
         target=run_web,
         daemon=True
     )
 
-    web_thread.start()
+    thread.start()
 
     application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .post_init(post_init)
         .build()
     )
 
+    # Commands
     application.add_handler(
         CommandHandler(
             "start",
-            start_command
+            start
         )
     )
 
     application.add_handler(
         CommandHandler(
             "admin",
-            admin_command
+            admin
         )
     )
 
     application.add_handler(
         CommandHandler(
             "stats",
-            stats_command
+            stats
         )
     )
 
     application.add_handler(
         CommandHandler(
             "setwelcome",
-            setwelcome_command
+            setwelcome
         )
     )
 
     application.add_handler(
         CommandHandler(
             "sethelp",
-            sethelp_command
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "setpdfprice",
-            setpdfprice_command
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "setvideoprice",
-            setvideoprice_command
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "setdays",
-            setdays_command
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "setupi",
-            setupi_command
+            sethelp
         )
     )
 
     application.add_handler(
         CommandHandler(
             "setpayment",
-            setpayment_command
+            setpayment
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "setupi",
+            setupi
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "setpdfprice",
+            set_pdf_price
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "setvideoprice",
+            set_video_price
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "setdays",
+            set_days
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "forcejoin",
+            forcejoin_toggle
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "addforcejoin",
+            add_force_join
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "removeforcejoin",
+            remove_force_join
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "pdf",
+            pdf_toggle
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "video",
+            video_toggle
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "txt",
+            txt_toggle
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "channelupload",
+            channel_upload_toggle
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "maintenance",
+            maintenance_toggle
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "premium",
+            manual_premium
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "removePremium",
+            remove_premium
         )
     )
 
     application.add_handler(
         CommandHandler(
             "setwelcomeimage",
-            setwelcomeimage_command
+            setwelcomeimage
         )
     )
 
     application.add_handler(
+        CommandHandler(
+            "channels",
+            channels
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "removechannel",
+            remove_channel
+        )
+    )
+
+    # Admin payment
+    application.add_handler(
         CallbackQueryHandler(
-            admin_payment_callback,
+            admin_payment_action,
             pattern=r"^(approve|reject)_"
         )
     )
 
+    # Normal callback
     application.add_handler(
         CallbackQueryHandler(
             callbacks
         )
     )
 
+    # Admin welcome image
     application.add_handler(
         MessageHandler(
             filters.PHOTO,
-            handle_admin_photo
+            admin_photo
         ),
-        group=10,
+        group=1
     )
 
+    # Payment screenshot
     application.add_handler(
         MessageHandler(
             filters.PHOTO,
-            handle_photo
+            payment_photo
         ),
-        group=20,
+        group=2
     )
 
+    # TXT
     application.add_handler(
         MessageHandler(
             filters.Document.FileExtension(
                 "txt"
             ),
-            handle_document
+            handle_txt
         )
     )
 
+    # Normal text
     application.add_handler(
         MessageHandler(
             filters.TEXT
-            & ~filters.COMMAND,
+            &
+            ~filters.COMMAND,
             handle_text
         )
     )
@@ -2650,4 +4412,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
