@@ -1,0 +1,8 @@
+# requirements.txt
+
+python-telegram-bot==22.5
+Flask==3.1.2
+aiohttp==3.12.15
+aiofiles==24.1.0
+python-dotenv==1.1.1
+gunicorn==23.0.0
