@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # main.py
 # MongoDB-based Telegram PDF/Video Downloader Bot
 # Features:
@@ -28,6 +29,7 @@ import asyncio
 import logging
 import mimetypes
 import tempfile
+from html import escape
 from pathlib import Path
 from urllib.parse import urlparse, unquote, quote
 
@@ -67,6 +69,23 @@ from telegram.ext import (
 # ============================================================
 
 load_dotenv()
+
+
+def fix_mojibake(value):
+    """Repair common UTF-8 mojibake while preserving valid Hindi."""
+    if not isinstance(value, str) or not value:
+        return value
+    if any("\\u0900" <= ch <= "\\u097f" for ch in value):
+        return value
+    for encoding in ("cp1251", "latin1"):
+        try:
+            repaired = value.encode(encoding).decode("utf-8")
+            if any("\\u0900" <= ch <= "\\u097f" for ch in repaired):
+                return repaired
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+    return value
+
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
@@ -338,10 +357,11 @@ def get_setting(
     if row is None:
         return default
 
-    return row.get(
+    value = row.get(
         "value",
         default
     )
+    return fix_mojibake(value) if isinstance(value, str) else value
 
 
 def set_setting(
@@ -836,7 +856,8 @@ def filename_from_response(
 async def download_file(
     url,
     output_dir,
-    requested_type=None
+    requested_type=None,
+    progress_callback=None
 ):
 
     original_url = url
@@ -1081,6 +1102,14 @@ async def download_file(
             )
 
             total = 0
+            try:
+                expected_total = int(response.headers.get("Content-Length", "0") or 0)
+            except (TypeError, ValueError):
+                expected_total = 0
+
+            async def report_progress(force=False):
+                if progress_callback:
+                    await progress_callback(total, expected_total, force)
 
             async with aiofiles.open(
                 path,
@@ -1111,6 +1140,7 @@ async def download_file(
                     await file.write(
                         first_chunk
                     )
+                    await report_progress()
 
                 async for chunk in response.content.iter_chunked(
                     1024 * 1024
@@ -1138,6 +1168,9 @@ async def download_file(
                     await file.write(
                         chunk
                     )
+                    await report_progress()
+
+            await report_progress(force=True)
 
             if total <= 0:
 
@@ -2180,7 +2213,9 @@ async def process_url(
     update,
     context,
     url,
-    requested_type
+    requested_type,
+    progress_message=None,
+    progress_prefix=""
 ):
 
     user = update.effective_user
@@ -2211,10 +2246,43 @@ async def process_url(
 
         async with download_lock:
 
+            async def progress_callback(downloaded, total_size, force=False):
+                if not progress_message:
+                    return
+                state = getattr(progress_message, "_progress_state", {"time": 0.0})
+                now = time.monotonic()
+                if not force and now - state["time"] < 1.0:
+                    return
+                state["time"] = now
+                progress_message._progress_state = state
+
+                if total_size > 0:
+                    percent = min(100, int(downloaded * 100 / total_size))
+                    filled = percent // 5
+                    bar = "тЦИ" * filled + "тЦС" * (20 - filled)
+                    text = (
+                        f"{progress_prefix}\\n"
+                        f"ЁЯУе {bar} {percent}%\\n"
+                        f"ЁЯУж {downloaded / 1024 / 1024:.2f} / {total_size / 1024 / 1024:.2f} MB"
+                    )
+                else:
+                    text = (
+                        f"{progress_prefix}\\n"
+                        f"ЁЯУе Downloading...\\n"
+                        f"ЁЯУж {downloaded / 1024 / 1024:.2f} MB"
+                    )
+                try:
+                    await progress_message.edit_text(fix_mojibake(text))
+                except Exception:
+                    pass
+
+            progress_message._progress_state = {"time": 0.0}
+
             result = await download_file(
                 url,
                 work_dir,
-                requested_type
+                requested_type,
+                progress_callback
             )
 
         detected = detect_type(
@@ -2283,6 +2351,19 @@ async def process_url(
                     parse_mode="HTML"
                 )
 
+        if progress_message:
+            try:
+                await progress_message.edit_text(
+                    fix_mojibake(
+                        f"{progress_prefix}\\n"
+                        f"тЬЕ Download complete\\n"
+                        f"ЁЯУД {result['filename']}\\n"
+                        f"ЁЯУж {result['size'] / 1024 / 1024:.2f} MB"
+                    )
+                )
+            except Exception:
+                pass
+
         return (
             True,
             "success"
@@ -2305,6 +2386,18 @@ async def process_url(
             url,
             str(exc)
         )
+
+        if progress_message:
+            try:
+                await progress_message.edit_text(
+                    fix_mojibake(
+                        f"{progress_prefix}\\n"
+                        f"тЭМ Download failed\\n"
+                        f"тЪая╕П {str(exc)[:900]}"
+                    )
+                )
+            except Exception:
+                pass
 
         return (
             False,
@@ -2622,24 +2715,32 @@ async def handle_text(
         1
     ):
 
-        if len(urls) > 1:
-
-            await update.message.reply_text(
-                f"ЁЯУе Processing {index}/{len(urls)}"
+        progress_message = await update.message.reply_text(
+            fix_mojibake(
+                f"ЁЯУе {index}/{len(urls)}\n"
+                "тП│ Download рд╢реБрд░реВ рд╣реЛ рд░рд╣рд╛ рд╣реИ..."
             )
+        )
 
         success, result = await process_url(
             update,
             context,
             url,
-            requested_type
+            requested_type,
+            progress_message=progress_message,
+            progress_prefix=f"ЁЯУД {index}/{len(urls)}"
         )
 
         if not success:
-
-            await update.message.reply_text(
-                f"тЭМ Failed:\n{result}"
-            )
+            try:
+                await progress_message.edit_text(
+                    fix_mojibake(
+                        f"ЁЯУД {index}/{len(urls)}\n"
+                        f"тЭМ Error: {result}"
+                    )
+                )
+            except Exception:
+                pass
 
 
 # ============================================================
@@ -2755,28 +2856,47 @@ async def handle_txt(
             return
 
         await update.message.reply_text(
-            f"ЁЯУЛ {len(urls)} links рдорд┐рд▓реЗред"
+            fix_mojibake(
+                f"ЁЯУЛ {len(urls)} links рдорд┐рд▓реЗред\n"
+                "тП│ Files рдПрдХ-рдПрдХ рдХрд░рдХреЗ download рд╣реЛрдВрдЧреАред"
+            )
+        )
+
+        requested_type = context.user_data.get(
+            "requested_type"
         )
 
         for index, url in enumerate(
             urls,
             1
         ):
-
-            await update.message.reply_text(
-                f"ЁЯУе {index}/{len(urls)}"
+            # Await keeps every PDF strictly sequential.
+            progress_message = await update.message.reply_text(
+                fix_mojibake(
+                    f"ЁЯУД {index}/{len(urls)}\n"
+                    "тП│ Download рд╢реБрд░реВ рд╣реЛ рд░рд╣рд╛ рд╣реИ..."
+                )
             )
 
-            requested_type = context.user_data.get(
-                "requested_type"
-            )
-
-            await process_url(
+            success, result = await process_url(
                 update,
                 context,
                 url,
-                requested_type
+                requested_type,
+                progress_message=progress_message,
+                progress_prefix=f"ЁЯУД {index}/{len(urls)}"
             )
+
+            if not success:
+                try:
+                    await progress_message.edit_text(
+                        fix_mojibake(
+                            f"ЁЯУД {index}/{len(urls)}\n"
+                            f"тЭМ Error: {result}"
+                        )
+                    )
+                except Exception:
+                    pass
 
     except Exception as exc:
 
