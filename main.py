@@ -29,7 +29,7 @@ import logging
 import mimetypes
 import tempfile
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote
 
 import aiohttp
 import aiofiles
@@ -157,6 +157,11 @@ DEFAULT_UPI = os.getenv(
     ""
 ).strip()
 
+PDF_PROXY_URL = os.getenv(
+    "PDF_PROXY_URL",
+    "https://proplayer.probrosystemset.workers.dev/segment?url="
+).strip()
+
 BASE_DIR = Path(
     __file__
 ).resolve().parent
@@ -253,25 +258,25 @@ channels_col.create_index(
 
 DEFAULT_SETTINGS = {
     "welcome_text": (
-        "🎓 <b>Welcome</b>\n\n"
-        "📥 PDF और Video download करने के लिए "
-        "नीचे दिए options का उपयोग करें।"
+        "ЁЯОУ <b>Welcome</b>\n\n"
+        "ЁЯУе PDF рдФрд░ Video download рдХрд░рдиреЗ рдХреЗ рд▓рд┐рдП "
+        "рдиреАрдЪреЗ рджрд┐рдП options рдХрд╛ рдЙрдкрдпреЛрдЧ рдХрд░реЗрдВред"
     ),
 
     "help_text": (
-        "🆘 <b>Help</b>\n\n"
-        "1. PDF Download दबाएँ और PDF URL भेजें।\n"
-        "2. Video Download दबाएँ और Video URL भेजें।\n"
-        "3. Multiple links के लिए TXT file भेजें।\n"
-        "4. Premium feature के लिए Buy Premium खोलें।\n\n"
-        "Channel में file भेजने के लिए पहले "
-        "अपना channel bot में add करें।"
+        "ЁЯЖШ <b>Help</b>\n\n"
+        "1. PDF Download рджрдмрд╛рдПрдБ рдФрд░ PDF URL рднреЗрдЬреЗрдВред\n"
+        "2. Video Download рджрдмрд╛рдПрдБ рдФрд░ Video URL рднреЗрдЬреЗрдВред\n"
+        "3. Multiple links рдХреЗ рд▓рд┐рдП TXT file рднреЗрдЬреЗрдВред\n"
+        "4. Premium feature рдХреЗ рд▓рд┐рдП Buy Premium рдЦреЛрд▓реЗрдВред\n\n"
+        "Channel рдореЗрдВ file рднреЗрдЬрдиреЗ рдХреЗ рд▓рд┐рдП рдкрд╣рд▓реЗ "
+        "рдЕрдкрдирд╛ channel bot рдореЗрдВ add рдХрд░реЗрдВред"
     ),
 
     "payment_text": (
-        "💳 Payment करने के बाद screenshot "
-        "और UTR/Transaction ID भेजें।\n\n"
-        "Admin verification के बाद access मिलेगा।"
+        "ЁЯТ│ Payment рдХрд░рдиреЗ рдХреЗ рдмрд╛рдж screenshot "
+        "рдФрд░ UTR/Transaction ID рднреЗрдЬреЗрдВред\n\n"
+        "Admin verification рдХреЗ рдмрд╛рдж access рдорд┐рд▓реЗрдЧрд╛ред"
     ),
 
     "upi_id": DEFAULT_UPI,
@@ -830,12 +835,43 @@ def filename_from_response(
 
 async def download_file(
     url,
-    output_dir
+    output_dir,
+    requested_type=None
 ):
 
+    original_url = url
     url = normalize_url(
         url
     )
+
+    # ========================================================
+    # PDF PROXY FLOW
+    # Same proxy endpoint used by pdf vvv.html:
+    # https://proplayer.probrosystemset.workers.dev/segment?url=
+    #
+    # The bot also sends the same browser-style headers already
+    # defined in COMMON_HEADERS/build_headers().
+    # ========================================================
+    is_pdf_request = (
+        requested_type == "pdf"
+        or
+        urlparse(url).path.lower().endswith(".pdf")
+        or
+        "pdf" in url.lower()
+        or
+        "appx-pdf" in url.lower()
+    )
+
+    request_url = url
+
+    if is_pdf_request and PDF_PROXY_URL:
+        request_url = (
+            PDF_PROXY_URL
+            + quote(
+                url,
+                safe=""
+            )
+        )
 
     timeout = aiohttp.ClientTimeout(
         total=DOWNLOAD_TIMEOUT,
@@ -849,20 +885,31 @@ async def download_file(
         ttl_dns_cache=300,
     )
 
+    headers = build_headers(
+        url
+    )
+
+    # PDF requests explicitly prefer the real PDF response.
+    if is_pdf_request:
+        headers["Accept"] = (
+            "application/pdf,"
+            "application/octet-stream,"
+            "*/*;q=0.8"
+        )
+
     async with aiohttp.ClientSession(
         timeout=timeout,
         connector=connector,
-        headers=build_headers(url),
+        headers=headers,
         raise_for_status=False,
     ) as session:
 
         async with session.get(
-            url,
+            request_url,
             allow_redirects=True,
         ) as response:
 
             if response.status >= 400:
-
                 raise RuntimeError(
                     f"HTTP {response.status}"
                 )
@@ -899,13 +946,93 @@ async def download_file(
                 ).lower()
             )
 
+            # ------------------------------------------------
+            # PDF response validation
+            # ------------------------------------------------
+            # The previous flow could save a tiny JSON/HTML/error
+            # response as ".pdf". A genuine PDF starts with %PDF-.
+            # We read the first chunk, validate it, then write it
+            # and continue streaming the rest.
+            # ------------------------------------------------
+            first_chunk = b""
+
+            if is_pdf_request:
+
+                first_chunk = await response.content.read(
+                    1024 * 1024
+                )
+
+                if not first_chunk:
+                    raise RuntimeError(
+                        "PDF response is empty"
+                    )
+
+                if not first_chunk.startswith(
+                    b"%PDF-"
+                ):
+
+                    preview = (
+                        first_chunk[:160]
+                        .decode(
+                            "utf-8",
+                            errors="ignore"
+                        )
+                        .replace(
+                            "\n",
+                            " "
+                        )
+                        .replace(
+                            "\r",
+                            " "
+                        )
+                    )
+
+                    raise RuntimeError(
+                        "PDF proxy did not return a valid PDF. "
+                        f"Response starts with: {preview[:120]}"
+                    )
+
             filename = (
                 filename_from_response(
                     response
                 )
             )
 
-            if filename == "download":
+            # The proxy URL normally has no useful filename.
+            # Prefer the original URL's filename for PDFs.
+            if is_pdf_request:
+
+                original_name = Path(
+                    urlparse(
+                        original_url
+                    ).path
+                ).name
+
+                original_name = sanitize_filename(
+                    original_name
+                )
+
+                if (
+                    original_name
+                    and
+                    original_name != "download"
+                    and
+                    "." in original_name
+                ):
+
+                    filename = original_name
+
+                elif (
+                    filename == "download"
+                    or
+                    not filename.lower().endswith(
+                        ".pdf"
+                    )
+                ):
+
+                    filename = "document.pdf"
+
+            elif filename == "download":
 
                 if "pdf" in content_type:
 
@@ -960,6 +1087,31 @@ async def download_file(
                 "wb"
             ) as file:
 
+                if first_chunk:
+
+                    total += len(
+                        first_chunk
+                    )
+
+                    if (
+                        total
+                        > MAX_FILE_SIZE
+                    ):
+
+                        try:
+                            path.unlink()
+                        except Exception:
+                            pass
+
+                        raise RuntimeError(
+                            "File size exceeds "
+                            f"{MAX_FILE_SIZE_MB} MB"
+                        )
+
+                    await file.write(
+                        first_chunk
+                    )
+
                 async for chunk in response.content.iter_chunked(
                     1024 * 1024
                 ):
@@ -998,13 +1150,55 @@ async def download_file(
                     "Downloaded file is empty"
                 )
 
+            # Extra safety: verify the saved PDF header too.
+            if is_pdf_request:
+
+                try:
+
+                    with open(
+                        path,
+                        "rb"
+                    ) as check_file:
+
+                        if (
+                            check_file.read(
+                                5
+                            )
+                            != b"%PDF-"
+                        ):
+
+                            path.unlink(
+                                missing_ok=True
+                            )
+
+                            raise RuntimeError(
+                                "Downloaded file is not a valid PDF"
+                            )
+
+                except RuntimeError:
+                    raise
+
+                except Exception as exc:
+
+                    path.unlink(
+                        missing_ok=True
+                    )
+
+                    raise RuntimeError(
+                        f"PDF validation failed: {exc}"
+                    )
+
+                content_type = (
+                    "application/pdf"
+                )
+
             return {
                 "path": str(path),
                 "filename": filename,
                 "size": total,
                 "content_type": content_type,
                 "final_url": str(
-                    response.url
+                    original_url
                 ),
             }
 
@@ -1143,22 +1337,22 @@ async def require_force_join(
 
             buttons.append([
                 InlineKeyboardButton(
-                    "📢 Join Channel",
+                    "ЁЯУв Join Channel",
                     url=invite
                 )
             ])
 
     buttons.append([
         InlineKeyboardButton(
-            "🔄 Check Join",
+            "ЁЯФД Check Join",
             callback_data="check_join"
         )
     ])
 
     await update.effective_message.reply_text(
-        "🔒 <b>Access Required</b>\n\n"
-        "Bot use करने से पहले required "
-        "channel join करें।",
+        "ЁЯФТ <b>Access Required</b>\n\n"
+        "Bot use рдХрд░рдиреЗ рд╕реЗ рдкрд╣рд▓реЗ required "
+        "channel join рдХрд░реЗрдВред",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             buttons
@@ -1183,7 +1377,7 @@ def main_keyboard():
 
         rows.append([
             InlineKeyboardButton(
-                "📄 PDF Download",
+                "ЁЯУД PDF Download",
                 callback_data="download_pdf"
             )
         ])
@@ -1195,14 +1389,14 @@ def main_keyboard():
 
         rows.append([
             InlineKeyboardButton(
-                "🎥 Video Download",
+                "ЁЯОе Video Download",
                 callback_data="download_video"
             )
         ])
 
     rows.append([
         InlineKeyboardButton(
-            "💎 Buy Premium",
+            "ЁЯТО Buy Premium",
             callback_data="premium"
         )
     ])
@@ -1214,14 +1408,14 @@ def main_keyboard():
 
         rows.append([
             InlineKeyboardButton(
-                "📢 Add Channel",
+                "ЁЯУв Add Channel",
                 callback_data="add_channel"
             )
         ])
 
     rows.append([
         InlineKeyboardButton(
-            "🆘 Help",
+            "ЁЯЖШ Help",
             callback_data="help"
         )
     ])
@@ -1260,7 +1454,7 @@ async def send_welcome(
     ) and user.id not in ADMIN_IDS:
 
         await update.effective_message.reply_text(
-            "🛠 Bot अभी maintenance mode में है।"
+            "ЁЯЫа Bot рдЕрднреА maintenance mode рдореЗрдВ рд╣реИред"
         )
 
         return
@@ -1361,7 +1555,7 @@ async def callbacks(
         ):
 
             await query.message.edit_text(
-                "✅ Channel membership verified."
+                "тЬЕ Channel membership verified."
             )
 
             await context.bot.send_message(
@@ -1377,7 +1571,7 @@ async def callbacks(
         else:
 
             await query.answer(
-                "पहले required channel join करें।",
+                "рдкрд╣рд▓реЗ required channel join рдХрд░реЗрдВред",
                 show_alert=True
             )
 
@@ -1390,14 +1584,14 @@ async def callbacks(
         ] = "pdf"
 
         await query.message.edit_text(
-            "📄 <b>PDF Download</b>\n\n"
-            "अब PDF का URL भेजें।\n\n"
-            "Multiple URLs के लिए TXT file भी भेज सकते हैं।",
+            "ЁЯУД <b>PDF Download</b>\n\n"
+            "рдЕрдм PDF рдХрд╛ URL рднреЗрдЬреЗрдВред\n\n"
+            "Multiple URLs рдХреЗ рд▓рд┐рдП TXT file рднреА рднреЗрдЬ рд╕рдХрддреЗ рд╣реИрдВред",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
-                        "⬅️ Back",
+                        "тмЕя╕П Back",
                         callback_data="home"
                     )
                 ]
@@ -1413,14 +1607,14 @@ async def callbacks(
         ] = "video"
 
         await query.message.edit_text(
-            "🎥 <b>Video Download</b>\n\n"
-            "अब video का direct/public URL भेजें।\n\n"
-            "Multiple URLs के लिए TXT file भी भेज सकते हैं।",
+            "ЁЯОе <b>Video Download</b>\n\n"
+            "рдЕрдм video рдХрд╛ direct/public URL рднреЗрдЬреЗрдВред\n\n"
+            "Multiple URLs рдХреЗ рд▓рд┐рдП TXT file рднреА рднреЗрдЬ рд╕рдХрддреЗ рд╣реИрдВред",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
-                        "⬅️ Back",
+                        "тмЕя╕П Back",
                         callback_data="home"
                     )
                 ]
@@ -1442,25 +1636,25 @@ async def callbacks(
         )
 
         await query.message.edit_text(
-            "💎 <b>Premium Plans</b>\n\n"
-            "Premium download के लिए plan select करें।",
+            "ЁЯТО <b>Premium Plans</b>\n\n"
+            "Premium download рдХреЗ рд▓рд┐рдП plan select рдХрд░реЗрдВред",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
-                        f"📄 PDF ₹{pdf_price}",
+                        f"ЁЯУД PDF тВ╣{pdf_price}",
                         callback_data="buy_pdf"
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        f"🎥 Video ₹{video_price}",
+                        f"ЁЯОе Video тВ╣{video_price}",
                         callback_data="buy_video"
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        "⬅️ Back",
+                        "тмЕя╕П Back",
                         callback_data="home"
                     )
                 ]
@@ -1507,12 +1701,12 @@ async def callbacks(
 
         await query.message.edit_text(
             (
-                f"💎 <b>Premium "
+                f"ЁЯТО <b>Premium "
                 f"{plan.upper()}</b>\n\n"
-                f"💰 Price: ₹{amount}\n"
-                f"🆔 Payment ID: "
+                f"ЁЯТ░ Price: тВ╣{amount}\n"
+                f"ЁЯЖФ Payment ID: "
                 f"<code>{payment_id}</code>\n\n"
-                f"💳 UPI: "
+                f"ЁЯТ│ UPI: "
                 f"<code>{upi}</code>\n\n"
                 f"{payment_text}"
             ),
@@ -1520,7 +1714,7 @@ async def callbacks(
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
-                        "📤 Payment Proof",
+                        "ЁЯУд Payment Proof",
                         callback_data=(
                             f"proof_{payment_id}"
                         )
@@ -1528,7 +1722,7 @@ async def callbacks(
                 ],
                 [
                     InlineKeyboardButton(
-                        "⬅️ Back",
+                        "тмЕя╕П Back",
                         callback_data="premium"
                     )
                 ]
@@ -1569,8 +1763,8 @@ async def callbacks(
         ] = payment_id
 
         await query.message.reply_text(
-            "📤 अब payment screenshot भेजें।\n"
-            "फिर UTR/Transaction ID text में भेजें।"
+            "ЁЯУд рдЕрдм payment screenshot рднреЗрдЬреЗрдВред\n"
+            "рдлрд┐рд░ UTR/Transaction ID text рдореЗрдВ рднреЗрдЬреЗрдВред"
         )
 
         return
@@ -1578,22 +1772,22 @@ async def callbacks(
     if data == "add_channel":
 
         await query.message.edit_text(
-            "📢 <b>Channel में PDF/Video भेजना</b>\n\n"
-            "Step 1️⃣: अपना Telegram channel बनाएं/खोलें।\n\n"
-            "Step 2️⃣: Bot को channel में Administrator बनाएं।\n\n"
-            "Step 3️⃣: Bot को कम-से-कम ये permissions दें:\n"
-            "• Post Messages\n"
-            "• Edit Messages\n"
-            "• Delete Messages (optional)\n\n"
-            "Step 4️⃣: Channel में कोई message भेजें।\n\n"
-            "Step 5️⃣: Bot में वापस आकर channel ID/username भेजें।\n\n"
-            "⚠️ Bot तभी channel में file भेज पाएगा "
-            "जब उसे channel में पर्याप्त permission मिले।",
+            "ЁЯУв <b>Channel рдореЗрдВ PDF/Video рднреЗрдЬрдирд╛</b>\n\n"
+            "Step 1я╕ПтГг: рдЕрдкрдирд╛ Telegram channel рдмрдирд╛рдПрдВ/рдЦреЛрд▓реЗрдВред\n\n"
+            "Step 2я╕ПтГг: Bot рдХреЛ channel рдореЗрдВ Administrator рдмрдирд╛рдПрдВред\n\n"
+            "Step 3я╕ПтГг: Bot рдХреЛ рдХрдо-рд╕реЗ-рдХрдо рдпреЗ permissions рджреЗрдВ:\n"
+            "тАв Post Messages\n"
+            "тАв Edit Messages\n"
+            "тАв Delete Messages (optional)\n\n"
+            "Step 4я╕ПтГг: Channel рдореЗрдВ рдХреЛрдИ message рднреЗрдЬреЗрдВред\n\n"
+            "Step 5я╕ПтГг: Bot рдореЗрдВ рд╡рд╛рдкрд╕ рдЖрдХрд░ channel ID/username рднреЗрдЬреЗрдВред\n\n"
+            "тЪая╕П Bot рддрднреА channel рдореЗрдВ file рднреЗрдЬ рдкрд╛рдПрдЧрд╛ "
+            "рдЬрдм рдЙрд╕реЗ channel рдореЗрдВ рдкрд░реНрдпрд╛рдкреНрдд permission рдорд┐рд▓реЗред",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
-                        "⬅️ Back",
+                        "тмЕя╕П Back",
                         callback_data="home"
                     )
                 ]
@@ -1617,7 +1811,7 @@ async def callbacks(
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
-                        "⬅️ Back",
+                        "тмЕя╕П Back",
                         callback_data="home"
                     )
                 ]
@@ -1657,7 +1851,7 @@ async def payment_photo(
     ):
 
         await update.message.reply_text(
-            "❌ Invalid payment."
+            "тЭМ Invalid payment."
         )
 
         return
@@ -1667,8 +1861,8 @@ async def payment_photo(
     ] = update.message.photo[-1].file_id
 
     await update.message.reply_text(
-        "✅ Screenshot receive हो गया।\n\n"
-        "अब UTR/Transaction ID भेजें।"
+        "тЬЕ Screenshot receive рд╣реЛ рдЧрдпрд╛ред\n\n"
+        "рдЕрдм UTR/Transaction ID рднреЗрдЬреЗрдВред"
     )
 
 
@@ -1727,7 +1921,7 @@ async def payment_utr(
     )
 
     admin_text = (
-        "💳 <b>New Payment Request</b>\n\n"
+        "ЁЯТ│ <b>New Payment Request</b>\n\n"
         f"Payment ID: "
         f"<code>{payment_id}</code>\n"
         f"User ID: "
@@ -1736,7 +1930,7 @@ async def payment_utr(
         f"@{user.username or 'N/A'}\n"
         f"Plan: "
         f"{payment['plan'].upper()}\n"
-        f"Amount: ₹{payment['amount']}\n"
+        f"Amount: тВ╣{payment['amount']}\n"
         f"UTR: "
         f"<code>{utr[:200]}</code>"
     )
@@ -1744,13 +1938,13 @@ async def payment_utr(
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "✅ APPROVE",
+                "тЬЕ APPROVE",
                 callback_data=(
                     f"approve_{payment_id}"
                 )
             ),
             InlineKeyboardButton(
-                "❌ REJECT",
+                "тЭМ REJECT",
                 callback_data=(
                     f"reject_{payment_id}"
                 )
@@ -1789,8 +1983,8 @@ async def payment_utr(
             )
 
     await update.message.reply_text(
-        "✅ Payment proof submit हो गया है।\n\n"
-        "Admin verification के बाद premium activate होगा।"
+        "тЬЕ Payment proof submit рд╣реЛ рдЧрдпрд╛ рд╣реИред\n\n"
+        "Admin verification рдХреЗ рдмрд╛рдж premium activate рд╣реЛрдЧрд╛ред"
     )
 
     context.user_data.pop(
@@ -1894,7 +2088,7 @@ async def admin_payment_action(
         )
 
         await query.message.reply_text(
-            "✅ Payment Approved\n"
+            "тЬЕ Payment Approved\n"
             f"Payment: {payment_id}\n"
             f"User: {payment['user_id']}\n"
             f"Premium: {days} days"
@@ -1905,12 +2099,12 @@ async def admin_payment_action(
             await context.bot.send_message(
                 payment["user_id"],
                 (
-                    "🎉 <b>Premium Activated!</b>\n\n"
+                    "ЁЯОЙ <b>Premium Activated!</b>\n\n"
                     f"Plan: "
                     f"{payment['plan'].upper()}\n"
                     f"Validity: "
                     f"{days} days\n\n"
-                    "अब premium download available है।"
+                    "рдЕрдм premium download available рд╣реИред"
                 ),
                 parse_mode="HTML",
                 reply_markup=main_keyboard()
@@ -1958,7 +2152,7 @@ async def admin_payment_action(
         )
 
         await query.message.reply_text(
-            f"❌ Payment Rejected\n"
+            f"тЭМ Payment Rejected\n"
             f"Payment: {payment_id}"
         )
 
@@ -1966,7 +2160,7 @@ async def admin_payment_action(
 
             await context.bot.send_message(
                 payment["user_id"],
-                "❌ आपका payment proof reject किया गया है।"
+                "тЭМ рдЖрдкрдХрд╛ payment proof reject рдХрд┐рдпрд╛ рдЧрдпрд╛ рд╣реИред"
             )
 
         except Exception:
@@ -2019,7 +2213,8 @@ async def process_url(
 
             result = await download_file(
                 url,
-                work_dir
+                work_dir,
+                requested_type
             )
 
         detected = detect_type(
@@ -2034,7 +2229,7 @@ async def process_url(
         ):
 
             raise RuntimeError(
-                "URL से requested file type नहीं मिला।"
+                "URL рд╕реЗ requested file type рдирд╣реАрдВ рдорд┐рд▓рд╛ред"
             )
 
         save_download_log(
@@ -2055,8 +2250,8 @@ async def process_url(
         )
 
         caption = (
-            f"📥 <b>{result['filename']}</b>\n\n"
-            f"📦 "
+            f"ЁЯУе <b>{result['filename']}</b>\n\n"
+            f"ЁЯУж "
             f"{result['size'] / 1024 / 1024:.2f} MB"
         )
 
@@ -2154,18 +2349,18 @@ async def send_log_channel(
     user = update.effective_user
 
     text = (
-        "📥 <b>DOWNLOAD LOG</b>\n\n"
-        f"👤 User ID: "
+        "ЁЯУе <b>DOWNLOAD LOG</b>\n\n"
+        f"ЁЯСд User ID: "
         f"<code>{user.id}</code>\n"
-        f"👤 Username: "
+        f"ЁЯСд Username: "
         f"@{user.username or 'N/A'}\n"
-        f"📁 File: "
+        f"ЁЯУБ File: "
         f"<code>{result['filename']}</code>\n"
-        f"📌 Type: "
+        f"ЁЯУМ Type: "
         f"{detected}\n"
-        f"📦 Size: "
+        f"ЁЯУж Size: "
         f"{result['size'] / 1024 / 1024:.2f} MB\n"
-        f"🔗 URL:\n"
+        f"ЁЯФЧ URL:\n"
         f"<code>{url[:3000]}</code>"
     )
 
@@ -2204,7 +2399,7 @@ async def send_error_log(
         await context.bot.send_message(
             channel_id,
             (
-                "❌ <b>DOWNLOAD ERROR</b>\n\n"
+                "тЭМ <b>DOWNLOAD ERROR</b>\n\n"
                 f"User: <code>{user.id}</code>\n"
                 f"URL:\n"
                 f"<code>{url[:3000]}</code>\n\n"
@@ -2237,7 +2432,7 @@ async def send_input_log(
         await context.bot.send_message(
             channel_id,
             (
-                f"📨 <b>{input_type}</b>\n\n"
+                f"ЁЯУи <b>{input_type}</b>\n\n"
                 f"User ID: <code>{user.id}</code>\n"
                 f"Username: @{user.username or 'N/A'}\n\n"
                 f"{content[:3500]}"
@@ -2306,7 +2501,7 @@ async def handle_text(
             }:
 
                 await update.message.reply_text(
-                    "❌ Bot को channel में Administrator बनाएं।"
+                    "тЭМ Bot рдХреЛ channel рдореЗрдВ Administrator рдмрдирд╛рдПрдВред"
                 )
 
                 return
@@ -2338,13 +2533,13 @@ async def handle_text(
 
             await update.message.reply_text(
                 (
-                    "✅ Channel successfully added.\n\n"
+                    "тЬЕ Channel successfully added.\n\n"
                     f"Channel: {chat.title or 'N/A'}\n"
                     f"ID: <code>{chat.id}</code>\n\n"
-                    "अब download के बाद file "
-                    "channel में भेजने का option "
-                    "admin configuration के अनुसार "
-                    "use किया जा सकता है।"
+                    "рдЕрдм download рдХреЗ рдмрд╛рдж file "
+                    "channel рдореЗрдВ рднреЗрдЬрдиреЗ рдХрд╛ option "
+                    "admin configuration рдХреЗ рдЕрдиреБрд╕рд╛рд░ "
+                    "use рдХрд┐рдпрд╛ рдЬрд╛ рд╕рдХрддрд╛ рд╣реИред"
                 ),
                 parse_mode="HTML"
             )
@@ -2352,9 +2547,9 @@ async def handle_text(
         except Exception as exc:
 
             await update.message.reply_text(
-                "❌ Channel add नहीं हुआ।\n\n"
-                "Bot को channel में Admin बनाकर "
-                "फिर channel username/ID भेजें।"
+                "тЭМ Channel add рдирд╣реАрдВ рд╣реБрдЖред\n\n"
+                "Bot рдХреЛ channel рдореЗрдВ Admin рдмрдирд╛рдХрд░ "
+                "рдлрд┐рд░ channel username/ID рднреЗрдЬреЗрдВред"
             )
 
             logger.warning(
@@ -2383,7 +2578,7 @@ async def handle_text(
     if not urls:
 
         await update.message.reply_text(
-            "❌ Valid HTTP/HTTPS URL नहीं मिला।"
+            "тЭМ Valid HTTP/HTTPS URL рдирд╣реАрдВ рдорд┐рд▓рд╛ред"
         )
 
         return
@@ -2397,11 +2592,11 @@ async def handle_text(
     ):
 
         await update.message.reply_text(
-            "💎 यह download feature Premium है।",
+            "ЁЯТО рдпрд╣ download feature Premium рд╣реИред",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
-                        "💎 Buy Premium",
+                        "ЁЯТО Buy Premium",
                         callback_data="premium"
                     )
                 ]
@@ -2418,8 +2613,8 @@ async def handle_text(
     )
 
     await update.message.reply_text(
-        f"🔎 {len(urls)} link मिले।\n"
-        "⏳ Download शुरू हो रहा है..."
+        f"ЁЯФО {len(urls)} link рдорд┐рд▓реЗред\n"
+        "тП│ Download рд╢реБрд░реВ рд╣реЛ рд░рд╣рд╛ рд╣реИ..."
     )
 
     for index, url in enumerate(
@@ -2430,7 +2625,7 @@ async def handle_text(
         if len(urls) > 1:
 
             await update.message.reply_text(
-                f"📥 Processing {index}/{len(urls)}"
+                f"ЁЯУе Processing {index}/{len(urls)}"
             )
 
         success, result = await process_url(
@@ -2443,7 +2638,7 @@ async def handle_text(
         if not success:
 
             await update.message.reply_text(
-                f"❌ Failed:\n{result}"
+                f"тЭМ Failed:\n{result}"
             )
 
 
@@ -2468,7 +2663,7 @@ async def handle_txt(
     ):
 
         await update.message.reply_text(
-            "❌ TXT batch download disabled है।"
+            "тЭМ TXT batch download disabled рд╣реИред"
         )
 
         return
@@ -2484,11 +2679,11 @@ async def handle_txt(
     ):
 
         await update.message.reply_text(
-            "💎 TXT batch download Premium feature है।",
+            "ЁЯТО TXT batch download Premium feature рд╣реИред",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
-                        "💎 Buy Premium",
+                        "ЁЯТО Buy Premium",
                         callback_data="premium"
                     )
                 ]
@@ -2507,7 +2702,7 @@ async def handle_txt(
     ):
 
         await update.message.reply_text(
-            "❌ केवल TXT file भेजें।"
+            "тЭМ рдХреЗрд╡рд▓ TXT file рднреЗрдЬреЗрдВред"
         )
 
         return
@@ -2554,13 +2749,13 @@ async def handle_txt(
         if not urls:
 
             await update.message.reply_text(
-                "❌ TXT में कोई valid URL नहीं मिला।"
+                "тЭМ TXT рдореЗрдВ рдХреЛрдИ valid URL рдирд╣реАрдВ рдорд┐рд▓рд╛ред"
             )
 
             return
 
         await update.message.reply_text(
-            f"📋 {len(urls)} links मिले।"
+            f"ЁЯУЛ {len(urls)} links рдорд┐рд▓реЗред"
         )
 
         for index, url in enumerate(
@@ -2569,7 +2764,7 @@ async def handle_txt(
         ):
 
             await update.message.reply_text(
-                f"📥 {index}/{len(urls)}"
+                f"ЁЯУе {index}/{len(urls)}"
             )
 
             requested_type = context.user_data.get(
@@ -2590,7 +2785,7 @@ async def handle_txt(
         )
 
         await update.message.reply_text(
-            f"❌ TXT error:\n{exc}"
+            f"тЭМ TXT error:\n{exc}"
         )
 
     finally:
@@ -2622,47 +2817,47 @@ async def admin(
     ):
 
         await update.message.reply_text(
-            "❌ Unauthorized"
+            "тЭМ Unauthorized"
         )
 
         return
 
     await update.message.reply_text(
         (
-            "👨‍💻 <b>ADMIN PANEL</b>\n\n"
+            "ЁЯСитАНЁЯТ╗ <b>ADMIN PANEL</b>\n\n"
 
-            "📊 /stats\n"
+            "ЁЯУК /stats\n"
 
-            "🏠 /setwelcome TEXT\n"
-            "🆘 /sethelp TEXT\n"
+            "ЁЯПа /setwelcome TEXT\n"
+            "ЁЯЖШ /sethelp TEXT\n"
 
-            "💰 /setpdfprice NUMBER\n"
-            "💰 /setvideoprice NUMBER\n"
-            "⏳ /setdays NUMBER\n"
-            "💳 /setupi UPI\n"
+            "ЁЯТ░ /setpdfprice NUMBER\n"
+            "ЁЯТ░ /setvideoprice NUMBER\n"
+            "тП│ /setdays NUMBER\n"
+            "ЁЯТ│ /setupi UPI\n"
             "/setpayment TEXT\n"
 
-            "🔒 /forcejoin on|off\n"
+            "ЁЯФТ /forcejoin on|off\n"
             "/addforcejoin CHAT_ID INVITE_URL\n"
             "/removeforcejoin CHAT_ID\n"
 
-            "📄 /pdf on|off\n"
-            "🎥 /video on|off\n"
-            "📋 /txt on|off\n"
+            "ЁЯУД /pdf on|off\n"
+            "ЁЯОе /video on|off\n"
+            "ЁЯУЛ /txt on|off\n"
 
-            "📢 /channelupload on|off\n"
-            "🛠 /maintenance on|off\n"
+            "ЁЯУв /channelupload on|off\n"
+            "ЁЯЫа /maintenance on|off\n"
 
-            "🖼 /setwelcomeimage\n"
+            "ЁЯЦ╝ /setwelcomeimage\n"
 
-            "👤 /premium USER_ID DAYS\n"
-            "🚫 /removePremium USER_ID\n"
+            "ЁЯСд /premium USER_ID DAYS\n"
+            "ЁЯЪл /removePremium USER_ID\n"
 
-            "📢 /channels\n"
+            "ЁЯУв /channels\n"
             "/removechannel CHAT_ID\n\n"
 
-            "💡 Welcome image बदलने के लिए:\n"
-            "/setwelcomeimage भेजें और फिर image भेजें।"
+            "ЁЯТб Welcome image рдмрджрд▓рдиреЗ рдХреЗ рд▓рд┐рдП:\n"
+            "/setwelcomeimage рднреЗрдЬреЗрдВ рдФрд░ рдлрд┐рд░ image рднреЗрдЬреЗрдВред"
         ),
         parse_mode="HTML"
     )
@@ -2709,13 +2904,13 @@ async def stats(
 
     await update.message.reply_text(
         (
-            "📊 <b>BOT STATISTICS</b>\n\n"
-            f"👥 Users: {users}\n"
-            f"💎 Active Premium: {premium}\n"
-            f"📥 Downloads: {downloads}\n"
-            f"✅ Successful: {success}\n"
-            f"💳 Pending Payments: {pending}\n"
-            f"💰 Approved Payments: {approved}"
+            "ЁЯУК <b>BOT STATISTICS</b>\n\n"
+            f"ЁЯСе Users: {users}\n"
+            f"ЁЯТО Active Premium: {premium}\n"
+            f"ЁЯУе Downloads: {downloads}\n"
+            f"тЬЕ Successful: {success}\n"
+            f"ЁЯТ│ Pending Payments: {pending}\n"
+            f"ЁЯТ░ Approved Payments: {approved}"
         ),
         parse_mode="HTML"
     )
@@ -2742,7 +2937,7 @@ async def setwelcome(
     if not text:
 
         await update.message.reply_text(
-            "/setwelcome आपका welcome message"
+            "/setwelcome рдЖрдкрдХрд╛ welcome message"
         )
 
         return
@@ -2753,7 +2948,7 @@ async def setwelcome(
     )
 
     await update.message.reply_text(
-        "✅ Welcome message updated."
+        "тЬЕ Welcome message updated."
     )
 
 
@@ -2774,7 +2969,7 @@ async def sethelp(
     if not text:
 
         await update.message.reply_text(
-            "/sethelp आपका help message"
+            "/sethelp рдЖрдкрдХрд╛ help message"
         )
 
         return
@@ -2785,7 +2980,7 @@ async def sethelp(
     )
 
     await update.message.reply_text(
-        "✅ Help updated."
+        "тЬЕ Help updated."
     )
 
 
@@ -2809,7 +3004,7 @@ async def setpayment(
     )
 
     await update.message.reply_text(
-        "✅ Payment instructions updated."
+        "тЬЕ Payment instructions updated."
     )
 
 
@@ -2841,7 +3036,7 @@ async def setupi(
     )
 
     await update.message.reply_text(
-        "✅ UPI updated."
+        "тЬЕ UPI updated."
     )
 
 
@@ -2914,7 +3109,7 @@ async def set_numeric_setting(
     except ValueError:
 
         await update.message.reply_text(
-            "❌ Invalid number."
+            "тЭМ Invalid number."
         )
 
         return
@@ -2925,7 +3120,7 @@ async def set_numeric_setting(
     )
 
     await update.message.reply_text(
-        f"✅ {key} = {value}"
+        f"тЬЕ {key} = {value}"
     )
 
 
@@ -2965,7 +3160,7 @@ async def toggle_setting(
     )
 
     await update.message.reply_text(
-        f"✅ {key}: "
+        f"тЬЕ {key}: "
         f"{'ON' if value else 'OFF'}"
     )
 
@@ -3077,7 +3272,7 @@ async def add_force_join(
     except ValueError:
 
         await update.message.reply_text(
-            "❌ Invalid CHAT_ID"
+            "тЭМ Invalid CHAT_ID"
         )
 
         return
@@ -3108,7 +3303,7 @@ async def add_force_join(
     )
 
     await update.message.reply_text(
-        "✅ Force join channel added."
+        "тЬЕ Force join channel added."
     )
 
 
@@ -3153,7 +3348,7 @@ async def remove_force_join(
     )
 
     await update.message.reply_text(
-        "✅ Force join channel removed."
+        "тЬЕ Force join channel removed."
     )
 
 
@@ -3194,7 +3389,7 @@ async def manual_premium(
     except ValueError:
 
         await update.message.reply_text(
-            "❌ Invalid values."
+            "тЭМ Invalid values."
         )
 
         return
@@ -3205,7 +3400,7 @@ async def manual_premium(
     )
 
     await update.message.reply_text(
-        "✅ Premium activated."
+        "тЬЕ Premium activated."
     )
 
 
@@ -3236,7 +3431,7 @@ async def remove_premium(
     )
 
     await update.message.reply_text(
-        "✅ Premium removed."
+        "тЬЕ Premium removed."
     )
 
 
@@ -3259,7 +3454,7 @@ async def setwelcomeimage(
     ] = True
 
     await update.message.reply_text(
-        "🖼 अब welcome image भेजें।"
+        "ЁЯЦ╝ рдЕрдм welcome image рднреЗрдЬреЗрдВред"
     )
 
 
@@ -3308,7 +3503,7 @@ async def admin_photo(
     )
 
     await update.message.reply_text(
-        "✅ Welcome image updated."
+        "тЬЕ Welcome image updated."
     )
 
 
@@ -3340,12 +3535,12 @@ async def channels(
 
         return
 
-    text = "📢 <b>CHANNELS</b>\n\n"
+    text = "ЁЯУв <b>CHANNELS</b>\n\n"
 
     for item in items:
 
         text += (
-            f"• {item.get('title','')}\n"
+            f"тАв {item.get('title','')}\n"
             f"  ID: <code>{item['chat_id']}</code>\n"
             f"  Owner: {item.get('owner_user_id')}\n\n"
         )
@@ -3385,7 +3580,7 @@ async def remove_channel(
     )
 
     await update.message.reply_text(
-        "✅ Channel removed."
+        "тЬЕ Channel removed."
     )
 
 
@@ -3478,7 +3673,7 @@ color:#aab4c4
 <div class="wrap">
 
 <div class="card">
-<h1>👨‍💻 Downloader Admin Panel</h1>
+<h1>ЁЯСитАНЁЯТ╗ Downloader Admin Panel</h1>
 <p>MongoDB Persistent Control Panel</p>
 </div>
 
@@ -3520,7 +3715,7 @@ action="/admin/save">
 
 <div class="card">
 
-<h2>🏠 Welcome</h2>
+<h2>ЁЯПа Welcome</h2>
 
 <label>Welcome Message</label>
 
@@ -3532,7 +3727,7 @@ name="welcome_text"
 
 <div class="card">
 
-<h2>🆘 Help</h2>
+<h2>ЁЯЖШ Help</h2>
 
 <label>Help Message</label>
 
@@ -3544,7 +3739,7 @@ name="help_text"
 
 <div class="card">
 
-<h2>💎 Premium</h2>
+<h2>ЁЯТО Premium</h2>
 
 <label>PDF Price</label>
 
@@ -3580,14 +3775,14 @@ name="payment_text"
 >{{settings.payment_text}}</textarea>
 
 <button>
-💾 Save Premium Settings
+ЁЯТ╛ Save Premium Settings
 </button>
 
 </div>
 
 <div class="card">
 
-<h2>⚙️ Features</h2>
+<h2>тЪЩя╕П Features</h2>
 
 <label>
 PDF Download
@@ -3698,7 +3893,7 @@ selected
 </label>
 
 <button>
-💾 Save Feature Settings
+ЁЯТ╛ Save Feature Settings
 </button>
 
 </div>
@@ -3707,7 +3902,7 @@ selected
 
 <div class="card">
 
-<h2>🖼 Welcome Image</h2>
+<h2>ЁЯЦ╝ Welcome Image</h2>
 
 <form
 method="post"
@@ -3730,7 +3925,7 @@ Upload / Change Welcome Image
 
 <div class="card">
 
-<h2>📢 Force Join Channels</h2>
+<h2>ЁЯУв Force Join Channels</h2>
 
 <form
 method="post"
@@ -3756,7 +3951,7 @@ Add Force Join Channel
 
 <div class="card">
 
-<h2>🚪 Logout</h2>
+<h2>ЁЯЪк Logout</h2>
 
 <a href="/admin/logout">
 Logout
